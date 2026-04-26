@@ -9,11 +9,16 @@
 //! `bg_*` / `i_*` conventions where practical so cross-referencing
 //! the kernel source is straightforward.
 
+pub mod dir_entry;
 pub mod extent;
 pub mod group_descriptor;
 pub mod inode;
 pub mod superblock;
 
+pub use dir_entry::{
+    decode_dir_block, DirEntry, DirEntryDecodeError, DirEntryFileType, DIR_ENTRY_ALIGNMENT,
+    DIR_ENTRY_HEADER_SIZE, DIR_ENTRY_NAME_MAX,
+};
 pub use extent::{
     decode_extent_node, Extent, ExtentDecodeError, ExtentHeader, ExtentIndex, ExtentNode,
     EXTENT_ENTRY_SIZE, EXTENT_HEADER_MAGIC, EXTENT_HEADER_SIZE,
