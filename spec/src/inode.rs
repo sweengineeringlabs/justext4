@@ -259,6 +259,50 @@ impl Inode {
     pub fn has_inline_data(&self) -> bool {
         self.flags & INODE_FLAG_INLINE_DATA != 0
     }
+
+    /// Serialise into the first `sb.inode_size` bytes of `buf`.
+    /// Bytes within the inode struct that this v0 layer doesn't
+    /// know about (extra-precision timestamps, crtime, projid,
+    /// inode checksum) are zeroed; anything past `sb.inode_size`
+    /// is caller-owned.
+    pub fn encode_into(&self, buf: &mut [u8], sb: &Superblock) -> Result<(), InodeEncodeError> {
+        let inode_size = sb.inode_size as usize;
+        if inode_size < MIN_INODE_SIZE as usize {
+            return Err(InodeEncodeError::SuperblockInodeSizeTooSmall {
+                size: sb.inode_size,
+            });
+        }
+        if buf.len() < inode_size {
+            return Err(InodeEncodeError::OutputTooSmall {
+                actual: buf.len(),
+                expected: inode_size,
+            });
+        }
+        buf[..inode_size].fill(0);
+
+        write_u16(buf, OFF_MODE, self.mode);
+        write_u16(buf, OFF_UID_LO, self.uid as u16);
+        write_u32(buf, OFF_SIZE_LO, self.size as u32);
+        write_u32(buf, OFF_ATIME, self.atime);
+        write_u32(buf, OFF_CTIME, self.ctime);
+        write_u32(buf, OFF_MTIME, self.mtime);
+        write_u32(buf, OFF_DTIME, self.dtime);
+        write_u16(buf, OFF_GID_LO, self.gid as u16);
+        write_u16(buf, OFF_LINKS_COUNT, self.links_count);
+        write_u32(buf, OFF_BLOCKS_LO, self.blocks_lo);
+        write_u32(buf, OFF_FLAGS, self.flags);
+        buf[OFF_BLOCK..OFF_BLOCK + I_BLOCK_LEN].copy_from_slice(&self.block);
+        write_u32(buf, OFF_GENERATION, self.generation);
+        write_u32(buf, OFF_FILE_ACL_LO, self.file_acl_lo);
+        write_u32(buf, OFF_SIZE_HI, (self.size >> 32) as u32);
+        // Linux OSD2 hi words.
+        write_u16(buf, OFF_BLOCKS_HI, self.blocks_hi);
+        write_u16(buf, OFF_FILE_ACL_HI, self.file_acl_hi);
+        write_u16(buf, OFF_UID_HI, (self.uid >> 16) as u16);
+        write_u16(buf, OFF_GID_HI, (self.gid >> 16) as u16);
+
+        Ok(())
+    }
 }
 
 fn read_u16(buf: &[u8], offset: usize) -> u16 {
@@ -272,6 +316,23 @@ fn read_u32(buf: &[u8], offset: usize) -> u32 {
         buf[offset + 2],
         buf[offset + 3],
     ])
+}
+
+fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
+    buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InodeEncodeError {
+    #[error("superblock reports inode_size {size}, below the kernel minimum of 128")]
+    SuperblockInodeSizeTooSmall { size: u16 },
+
+    #[error("output buffer too small: have {actual} bytes, expected {expected}")]
+    OutputTooSmall { actual: usize, expected: usize },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -570,5 +631,47 @@ mod tests {
         assert_eq!(inode.blocks_lo, 8);
         assert!(inode.uses_extents());
         assert!(!inode.has_inline_data());
+    }
+
+    /// Decode → encode → decode preserves every load-bearing
+    /// field, including OSD2 hi-words.
+    ///
+    /// Bug it catches: any field-offset error in the encoder
+    /// — particularly easy to slip on the OSD2 fields whose
+    /// offsets (0x74-0x7B) overlap the boundary between the
+    /// rev-0 core (128 bytes) and rev-1 extras. The test
+    /// populates uid/gid past 65535 to force the OSD2 path.
+    #[test]
+    fn test_encode_then_decode_preserves_every_field() {
+        let sb = make_sb_with_inode_size(256);
+        let mut buf = vec![0u8; 256];
+        write_u16(&mut buf, OFF_MODE, 0o100644);
+        write_u16(&mut buf, OFF_UID_LO, 0xABCD);
+        write_u16(&mut buf, OFF_UID_HI, 0x0001);
+        write_u16(&mut buf, OFF_GID_LO, 0x1234);
+        write_u16(&mut buf, OFF_GID_HI, 0x0002);
+        write_u32(&mut buf, OFF_SIZE_LO, 0x0000_1000);
+        write_u32(&mut buf, OFF_SIZE_HI, 0x0000_0001);
+        write_u32(&mut buf, OFF_ATIME, 0x6500_AAAA);
+        write_u32(&mut buf, OFF_CTIME, 0x6500_BBBB);
+        write_u32(&mut buf, OFF_MTIME, 0x6500_CCCC);
+        write_u32(&mut buf, OFF_DTIME, 0x6500_DDDD);
+        write_u16(&mut buf, OFF_LINKS_COUNT, 5);
+        write_u32(&mut buf, OFF_BLOCKS_LO, 16);
+        write_u32(&mut buf, OFF_FLAGS, INODE_FLAG_EXTENTS);
+        let i_block: [u8; I_BLOCK_LEN] = std::array::from_fn(|i| (i ^ 0xA5) as u8);
+        buf[OFF_BLOCK..OFF_BLOCK + I_BLOCK_LEN].copy_from_slice(&i_block);
+        write_u32(&mut buf, OFF_GENERATION, 0xDEAD_BEEF);
+        write_u32(&mut buf, OFF_FILE_ACL_LO, 0x4242_4242);
+        write_u16(&mut buf, OFF_FILE_ACL_HI, 0x0007);
+        write_u16(&mut buf, OFF_BLOCKS_HI, 0x0003);
+
+        let i1 = Inode::decode(&buf, &sb).unwrap();
+
+        let mut encoded = vec![0u8; 256];
+        i1.encode_into(&mut encoded, &sb).unwrap();
+        let i2 = Inode::decode(&encoded, &sb).unwrap();
+
+        assert_eq!(i1, i2);
     }
 }

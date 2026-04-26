@@ -81,6 +81,22 @@ impl ExtentHeader {
     pub fn is_leaf(&self) -> bool {
         self.depth == 0
     }
+
+    /// Serialise the 12-byte header at the start of `buf`.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<(), ExtentEncodeError> {
+        if buf.len() < EXTENT_HEADER_SIZE {
+            return Err(ExtentEncodeError::OutputTooSmall {
+                actual: buf.len(),
+                expected: EXTENT_HEADER_SIZE,
+            });
+        }
+        write_u16(buf, 0, EXTENT_HEADER_MAGIC);
+        write_u16(buf, 2, self.entries);
+        write_u16(buf, 4, self.max);
+        write_u16(buf, 6, self.depth);
+        write_u32(buf, 8, self.generation);
+        Ok(())
+    }
 }
 
 /// Leaf-node entry: a contiguous run of physical blocks mapped to
@@ -135,6 +151,31 @@ impl Extent {
             uninit,
         })
     }
+
+    /// Serialise into the first 12 bytes of `buf`. Re-applies the
+    /// uninit-flag convention by adding 32768 to `len` when
+    /// `uninit` is true.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<(), ExtentEncodeError> {
+        if buf.len() < EXTENT_ENTRY_SIZE {
+            return Err(ExtentEncodeError::OutputTooSmall {
+                actual: buf.len(),
+                expected: EXTENT_ENTRY_SIZE,
+            });
+        }
+        if self.len > EXTENT_UNINIT_THRESHOLD {
+            return Err(ExtentEncodeError::LengthOutOfRange { len: self.len });
+        }
+        let raw_len = if self.uninit {
+            self.len + EXTENT_UNINIT_THRESHOLD
+        } else {
+            self.len
+        };
+        write_u32(buf, 0, self.logical_block);
+        write_u16(buf, 4, raw_len);
+        write_u16(buf, 6, (self.physical_block >> 32) as u16);
+        write_u32(buf, 8, self.physical_block as u32);
+        Ok(())
+    }
 }
 
 /// Internal-node entry: pointer to a next-level extent tree node.
@@ -164,6 +205,21 @@ impl ExtentIndex {
             logical_block: read_u32(buf, 0),
             leaf_block: (leaf_hi << 32) | leaf_lo,
         })
+    }
+
+    /// Serialise into the first 12 bytes of `buf`.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<(), ExtentEncodeError> {
+        if buf.len() < EXTENT_ENTRY_SIZE {
+            return Err(ExtentEncodeError::OutputTooSmall {
+                actual: buf.len(),
+                expected: EXTENT_ENTRY_SIZE,
+            });
+        }
+        write_u32(buf, 0, self.logical_block);
+        write_u32(buf, 4, self.leaf_block as u32);
+        write_u16(buf, 8, (self.leaf_block >> 32) as u16);
+        write_u16(buf, 10, 0); // ei_unused
+        Ok(())
     }
 }
 
@@ -225,6 +281,23 @@ fn read_u32(buf: &[u8], offset: usize) -> u32 {
         buf[offset + 2],
         buf[offset + 3],
     ])
+}
+
+fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
+    buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ExtentEncodeError {
+    #[error("output buffer too small: have {actual} bytes, expected {expected}")]
+    OutputTooSmall { actual: usize, expected: usize },
+
+    #[error("extent length {len} exceeds 32768 — use the uninit flag, don't pre-shift the length")]
+    LengthOutOfRange { len: u16 },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -489,5 +562,78 @@ mod tests {
             }
             ExtentNode::Internal { .. } => panic!("expected Leaf"),
         }
+    }
+
+    /// Round-trip header + leaf extent + index entry through
+    /// encode/decode.
+    ///
+    /// Bug it catches: any field-offset slip in any of the
+    /// encoders surfaces as a value mismatch on the second
+    /// decode. Notably catches: extent leaf vs index layout
+    /// confusion (the lo/hi field offsets differ between leaf
+    /// and index entries — same bytes, different meaning).
+    #[test]
+    fn test_encode_then_decode_round_trips_header_leaf_and_index() {
+        // Header
+        let h1 = ExtentHeader {
+            entries: 3,
+            max: 4,
+            depth: 1,
+            generation: 0xDEAD_BEEF,
+        };
+        let mut hbuf = vec![0u8; EXTENT_HEADER_SIZE];
+        h1.encode_into(&mut hbuf).unwrap();
+        let h2 = ExtentHeader::decode(&hbuf).unwrap();
+        assert_eq!(h1, h2);
+
+        // Leaf extent (initialised)
+        let e1 = Extent {
+            logical_block: 100,
+            len: 8,
+            physical_block: 0x0001_0000_0042,
+            uninit: false,
+        };
+        let mut ebuf = vec![0u8; EXTENT_ENTRY_SIZE];
+        e1.encode_into(&mut ebuf).unwrap();
+        let e2 = Extent::decode(&ebuf).unwrap();
+        assert_eq!(e1, e2);
+
+        // Leaf extent (uninit)
+        let u1 = Extent {
+            logical_block: 200,
+            len: 4,
+            physical_block: 0x0000_0001_0000,
+            uninit: true,
+        };
+        let mut ubuf = vec![0u8; EXTENT_ENTRY_SIZE];
+        u1.encode_into(&mut ubuf).unwrap();
+        let u2 = Extent::decode(&ubuf).unwrap();
+        assert_eq!(u1, u2);
+
+        // Index entry
+        let i1 = ExtentIndex {
+            logical_block: 1000,
+            leaf_block: 0x0002_0000_0099,
+        };
+        let mut ibuf = vec![0u8; EXTENT_ENTRY_SIZE];
+        i1.encode_into(&mut ibuf).unwrap();
+        let i2 = ExtentIndex::decode(&ibuf).unwrap();
+        assert_eq!(i1, i2);
+    }
+
+    /// Encoder rejects len > 32768 — the uninit flag must be
+    /// expressed via the typed bool, not by pre-shifting the
+    /// length.
+    #[test]
+    fn test_extent_encode_rejects_length_above_32768() {
+        let e = Extent {
+            logical_block: 0,
+            len: 40000, // would be ambiguous with uninit if encoded raw
+            physical_block: 0,
+            uninit: false,
+        };
+        let mut buf = vec![0u8; EXTENT_ENTRY_SIZE];
+        let err = e.encode_into(&mut buf).unwrap_err();
+        assert_eq!(err, ExtentEncodeError::LengthOutOfRange { len: 40000 });
     }
 }

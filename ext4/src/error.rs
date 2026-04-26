@@ -1,8 +1,9 @@
 //! Error type for the ext4 read API.
 
 use spec::{
-    DirEntryDecodeError, ExtentDecodeError, GroupDescriptorDecodeError, InodeDecodeError,
-    SuperblockDecodeError,
+    DirEntryDecodeError, DirEntryEncodeError, ExtentDecodeError, ExtentEncodeError,
+    GroupDescriptorDecodeError, GroupDescriptorEncodeError, InodeDecodeError, InodeEncodeError,
+    SuperblockDecodeError, SuperblockEncodeError,
 };
 
 /// All failure modes the read API surfaces.
@@ -47,6 +48,23 @@ pub enum Ext4Error {
     /// `/etc/passwd` is a regular file.
     #[error("not a directory: inode {inode}")]
     NotADirectory { inode: u32 },
+
+    /// Encode-side errors when writing structures back to bytes
+    /// (used by `mkfs::format` and any future write paths).
+    #[error("superblock encode: {0}")]
+    SuperblockEncode(#[from] SuperblockEncodeError),
+
+    #[error("group descriptor encode: {0}")]
+    GroupDescriptorEncode(#[from] GroupDescriptorEncodeError),
+
+    #[error("inode encode: {0}")]
+    InodeEncode(#[from] InodeEncodeError),
+
+    #[error("extent encode: {0}")]
+    ExtentEncode(#[from] ExtentEncodeError),
+
+    #[error("directory entry encode: {0}")]
+    DirEntryEncode(#[from] DirEntryEncodeError),
 
     /// Extent walk requested on an inode that uses the legacy
     /// ext2/3 block-pointer scheme rather than ext4 extents.

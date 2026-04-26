@@ -9,6 +9,8 @@
 
 pub mod error;
 pub mod filesystem;
+pub mod mkfs;
 
 pub use error::Ext4Error;
-pub use filesystem::Filesystem;
+pub use filesystem::{Filesystem, ROOT_INODE};
+pub use mkfs::{format, Config};

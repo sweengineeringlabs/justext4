@@ -163,6 +163,55 @@ impl DirEntry {
     pub fn is_unused(&self) -> bool {
         self.inode == 0
     }
+
+    /// Serialise the entry into the start of `buf`. Writes
+    /// `rec_len` bytes total — header + name + alignment padding
+    /// (zeroed). The caller is responsible for choosing
+    /// `self.rec_len` such that subsequent entries land at the
+    /// right offset; for the last entry of a block the kernel
+    /// expects `rec_len` to absorb the rest of the block.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<(), DirEntryEncodeError> {
+        let rec_len = self.rec_len as usize;
+        if rec_len < DIR_ENTRY_HEADER_SIZE {
+            return Err(DirEntryEncodeError::RecLenBelowHeaderSize {
+                rec_len: self.rec_len,
+            });
+        }
+        if rec_len % DIR_ENTRY_ALIGNMENT != 0 {
+            return Err(DirEntryEncodeError::RecLenNotAligned {
+                rec_len: self.rec_len,
+            });
+        }
+        if self.name.len() > DIR_ENTRY_NAME_MAX as usize {
+            return Err(DirEntryEncodeError::NameTooLong {
+                name_len: self.name.len(),
+            });
+        }
+        let name_end = DIR_ENTRY_HEADER_SIZE + self.name.len();
+        if name_end > rec_len {
+            return Err(DirEntryEncodeError::NameLenExceedsRecLen {
+                name_len: self.name.len() as u8,
+                rec_len: self.rec_len,
+            });
+        }
+        if buf.len() < rec_len {
+            return Err(DirEntryEncodeError::OutputTooSmall {
+                actual: buf.len(),
+                expected: rec_len,
+            });
+        }
+
+        // Zero the full record so trailing pad bytes are
+        // deterministic.
+        buf[..rec_len].fill(0);
+
+        write_u32(buf, 0, self.inode);
+        write_u16(buf, 4, self.rec_len);
+        buf[6] = self.name.len() as u8;
+        buf[7] = self.file_type_raw;
+        buf[DIR_ENTRY_HEADER_SIZE..name_end].copy_from_slice(&self.name);
+        Ok(())
+    }
 }
 
 /// Walk a directory data block, decoding every entry it contains.
@@ -203,6 +252,32 @@ fn read_u32(buf: &[u8], offset: usize) -> u32 {
         buf[offset + 2],
         buf[offset + 3],
     ])
+}
+
+fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
+    buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DirEntryEncodeError {
+    #[error("output buffer too small: have {actual} bytes, expected {expected}")]
+    OutputTooSmall { actual: usize, expected: usize },
+
+    #[error("rec_len {rec_len} is below the 8-byte header")]
+    RecLenBelowHeaderSize { rec_len: u16 },
+
+    #[error("rec_len {rec_len} is not aligned to 4 bytes")]
+    RecLenNotAligned { rec_len: u16 },
+
+    #[error("name length {name_len} exceeds the 255-byte field maximum")]
+    NameTooLong { name_len: usize },
+
+    #[error("name_len {name_len} would extend past rec_len {rec_len}")]
+    NameLenExceedsRecLen { name_len: u8, rec_len: u16 },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -479,5 +554,57 @@ mod tests {
         assert_eq!(entries[1].name, b"..");
         assert_eq!(entries[2].name, b"lost+found");
         assert_eq!(entries[2].inode, 11);
+    }
+
+    /// Encode a single entry, decode it back, assert equality.
+    /// Including padding bytes and a non-default file_type.
+    #[test]
+    fn test_dir_entry_encode_then_decode_round_trips() {
+        let e1 = DirEntry {
+            inode: 11,
+            rec_len: 24, // 8 header + 9 name "hello.txt" → 17, padded to 20; pick 24
+            file_type_raw: 1,
+            name: b"hello.txt".to_vec(),
+        };
+        let mut buf = vec![0xAAu8; 32];
+        e1.encode_into(&mut buf).unwrap();
+        let e2 = DirEntry::decode(&buf).unwrap();
+        assert_eq!(e1, e2);
+        // Padding bytes must be zero so the on-disk form is
+        // deterministic across encodes — the kernel relies on
+        // this for checksum stability.
+        assert!(buf[17..24].iter().all(|&b| b == 0));
+    }
+
+    /// Encoder rejects a rec_len smaller than the header.
+    #[test]
+    fn test_dir_entry_encode_rejects_rec_len_below_header() {
+        let e = DirEntry {
+            inode: 1,
+            rec_len: 4,
+            file_type_raw: 1,
+            name: vec![],
+        };
+        let mut buf = vec![0u8; 16];
+        let err = e.encode_into(&mut buf).unwrap_err();
+        assert_eq!(
+            err,
+            DirEntryEncodeError::RecLenBelowHeaderSize { rec_len: 4 }
+        );
+    }
+
+    /// Encoder rejects an unaligned rec_len that the decoder
+    /// would reject.
+    #[test]
+    fn test_dir_entry_encode_rejects_unaligned_rec_len() {
+        let e = DirEntry {
+            inode: 1,
+            rec_len: 10,
+            file_type_raw: 1,
+            name: vec![],
+        };
+        let mut buf = vec![0u8; 16];
+        let err = e.encode_into(&mut buf).unwrap_err();
+        assert_eq!(err, DirEntryEncodeError::RecLenNotAligned { rec_len: 10 });
     }
 }

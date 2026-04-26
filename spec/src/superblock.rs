@@ -264,6 +264,66 @@ impl Superblock {
             .unwrap_or(self.volume_name.len());
         std::str::from_utf8(&self.volume_name[..end]).unwrap_or("")
     }
+
+    /// Serialise the superblock into the first
+    /// [`SUPERBLOCK_SIZE`] bytes of `buf`. Bytes past the end of
+    /// the fields this v0 layer covers are zeroed; the on-disk
+    /// layout reserves them for fields the spec layer doesn't yet
+    /// decode.
+    ///
+    /// Block-size encoding inverts the decode rule:
+    /// `1024 << s_log_block_size`. Block sizes outside
+    /// {1024, 2048, 4096, 65536} are rejected — the same set the
+    /// kernel accepts on the read side.
+    pub fn encode_into(&self, buf: &mut [u8]) -> Result<(), SuperblockEncodeError> {
+        if buf.len() < SUPERBLOCK_SIZE {
+            return Err(SuperblockEncodeError::OutputTooSmall { actual: buf.len() });
+        }
+        // Zero the destination so reserved fields don't carry stale
+        // caller bytes through into our output.
+        buf[..SUPERBLOCK_SIZE].fill(0);
+
+        let log_block_size = match self.block_size {
+            1024 => 0u32,
+            2048 => 1,
+            4096 => 2,
+            65536 => 6,
+            other => {
+                return Err(SuperblockEncodeError::InvalidBlockSize { block_size: other });
+            }
+        };
+
+        write_u32(buf, OFF_INODES_COUNT, self.inodes_count);
+        write_u32(buf, OFF_BLOCKS_COUNT_LO, self.blocks_count as u32);
+        write_u32(buf, OFF_FREE_BLOCKS_COUNT_LO, self.free_blocks_count as u32);
+        write_u32(buf, OFF_FREE_INODES_COUNT, self.free_inodes_count);
+        write_u32(buf, OFF_FIRST_DATA_BLOCK, self.first_data_block);
+        write_u32(buf, OFF_LOG_BLOCK_SIZE, log_block_size);
+        write_u32(buf, OFF_BLOCKS_PER_GROUP, self.blocks_per_group);
+        write_u32(buf, OFF_INODES_PER_GROUP, self.inodes_per_group);
+        write_u16(buf, OFF_MAGIC, EXT4_MAGIC);
+        write_u32(buf, OFF_REV_LEVEL, self.rev_level);
+        write_u16(buf, OFF_INODE_SIZE, self.inode_size);
+        write_u32(buf, OFF_FEATURE_COMPAT, self.feature_compat);
+        write_u32(buf, OFF_FEATURE_INCOMPAT, self.feature_incompat);
+        write_u32(buf, OFF_FEATURE_RO_COMPAT, self.feature_ro_compat);
+        buf[OFF_UUID..OFF_UUID + 16].copy_from_slice(&self.uuid);
+        buf[OFF_VOLUME_NAME..OFF_VOLUME_NAME + 16].copy_from_slice(&self.volume_name);
+        write_u16(buf, OFF_DESC_SIZE, self.desc_size);
+
+        // 64-bit hi-words land only when the feature is set; on
+        // 32-bit images those offsets stay zeroed by the fill above.
+        if self.is_64bit() {
+            write_u32(buf, OFF_BLOCKS_COUNT_HI, (self.blocks_count >> 32) as u32);
+            write_u32(
+                buf,
+                OFF_FREE_BLOCKS_COUNT_HI,
+                (self.free_blocks_count >> 32) as u32,
+            );
+        }
+
+        Ok(())
+    }
 }
 
 fn read_u16(buf: &[u8], offset: usize) -> u16 {
@@ -279,12 +339,31 @@ fn read_u32(buf: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
+    buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 fn combine_hi_lo(hi: u32, lo: u32, is_64bit: bool) -> u64 {
     if is_64bit {
         ((hi as u64) << 32) | (lo as u64)
     } else {
         lo as u64
     }
+}
+
+/// Encode-side errors. Symmetric to [`SuperblockDecodeError`] in
+/// shape but distinct in type so callers can route on direction.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SuperblockEncodeError {
+    #[error("output buffer too small: have {actual} bytes, need 1024")]
+    OutputTooSmall { actual: usize },
+
+    #[error("invalid block_size {block_size}: must be 1024, 2048, 4096, or 65536")]
+    InvalidBlockSize { block_size: u32 },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -629,5 +708,86 @@ mod tests {
         // blocks_per_group already 0 from buf_with.
         let sb = Superblock::decode(&buf).unwrap();
         assert_eq!(sb.group_count(), 0);
+    }
+
+    /// Decode → encode → decode preserves every load-bearing
+    /// field byte-for-byte.
+    ///
+    /// Bug it catches: any field-offset error in the encoder
+    /// would surface here — the second decode reads back from the
+    /// same offsets the original was written to, so a slip in one
+    /// field's encode would either land in the wrong field on
+    /// re-decode (visible mismatch) or land in a reserved offset
+    /// the decoder ignores (silent loss; the round-trip catches
+    /// it because the field's value comes back as zero).
+    #[test]
+    fn test_encode_then_decode_preserves_every_field() {
+        // Build a richly-populated source via the existing helper
+        // and field pokes — covers every encoded field with a
+        // distinguishable non-zero value.
+        let mut src = buf_with(EXT4_MAGIC, 2, 1, FEATURE_INCOMPAT_64BIT);
+        write_u32(&mut src, OFF_INODES_COUNT, 0x0000_1000);
+        write_u32(&mut src, OFF_BLOCKS_COUNT_LO, 0x0000_2000);
+        write_u32(&mut src, OFF_BLOCKS_COUNT_HI, 0x0000_0001);
+        write_u32(&mut src, OFF_FREE_BLOCKS_COUNT_LO, 0x0000_0500);
+        write_u32(&mut src, OFF_FREE_BLOCKS_COUNT_HI, 0x0000_0001);
+        write_u32(&mut src, OFF_FREE_INODES_COUNT, 0x0000_0FF0);
+        write_u32(&mut src, OFF_FIRST_DATA_BLOCK, 1);
+        write_u32(&mut src, OFF_BLOCKS_PER_GROUP, 32768);
+        write_u32(&mut src, OFF_INODES_PER_GROUP, 8192);
+        src[OFF_INODE_SIZE..OFF_INODE_SIZE + 2].copy_from_slice(&256u16.to_le_bytes());
+        src[OFF_DESC_SIZE..OFF_DESC_SIZE + 2].copy_from_slice(&64u16.to_le_bytes());
+        src[OFF_FEATURE_COMPAT..OFF_FEATURE_COMPAT + 4]
+            .copy_from_slice(&0xAAAA_BBBBu32.to_le_bytes());
+        src[OFF_FEATURE_RO_COMPAT..OFF_FEATURE_RO_COMPAT + 4]
+            .copy_from_slice(&0xCCCC_DDDDu32.to_le_bytes());
+        let uuid = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+            0xCD, 0xEF,
+        ];
+        src[OFF_UUID..OFF_UUID + 16].copy_from_slice(&uuid);
+        let label = b"my-rootfs\0\0\0\0\0\0\0";
+        src[OFF_VOLUME_NAME..OFF_VOLUME_NAME + 16].copy_from_slice(label);
+
+        let sb1 = Superblock::decode(&src).unwrap();
+
+        let mut encoded = vec![0u8; SUPERBLOCK_SIZE];
+        sb1.encode_into(&mut encoded).unwrap();
+        let sb2 = Superblock::decode(&encoded).unwrap();
+
+        assert_eq!(sb1, sb2);
+    }
+
+    /// Encode rejects an invalid block_size that the decoder
+    /// would also reject.
+    ///
+    /// Bug it catches: an encoder that doesn't validate could
+    /// write a Superblock with `block_size = 8192` (not 1024 <<
+    /// any valid log shift). The decode side would then fail to
+    /// open it. Symmetric validation at both sides means
+    /// round-tripping our own output is always safe.
+    #[test]
+    fn test_encode_rejects_invalid_block_size() {
+        // Construct via decode of a valid superblock, then mutate
+        // block_size to an invalid value before re-encoding.
+        let buf = buf_with(EXT4_MAGIC, 2, 1, 0);
+        let mut sb = Superblock::decode(&buf).unwrap();
+        sb.block_size = 8192;
+        let mut out = vec![0u8; SUPERBLOCK_SIZE];
+        let err = sb.encode_into(&mut out).unwrap_err();
+        assert_eq!(
+            err,
+            SuperblockEncodeError::InvalidBlockSize { block_size: 8192 }
+        );
+    }
+
+    /// Encode rejects a too-small output buffer.
+    #[test]
+    fn test_encode_rejects_short_output_buffer() {
+        let buf = buf_with(EXT4_MAGIC, 2, 1, 0);
+        let sb = Superblock::decode(&buf).unwrap();
+        let mut out = vec![0u8; 512];
+        let err = sb.encode_into(&mut out).unwrap_err();
+        assert_eq!(err, SuperblockEncodeError::OutputTooSmall { actual: 512 });
     }
 }

@@ -1,0 +1,390 @@
+//! Format an ext4 image. The pure-Rust `mkfs.ext4` analogue.
+//!
+//! v0 lays down a minimal valid filesystem: one block group, the
+//! standard reserved inodes (1-10) zeroed, root directory at inode
+//! 2 with the canonical "." and ".." entries. The output is
+//! readable by [`crate::Filesystem::open`] and the kernel can
+//! mount it (subject to the v0 limitations called out below).
+//!
+//! Out of scope for v0:
+//!
+//! - Lost+found directory and the second standard inode (11).
+//! - Block / inode bitmap correctness — the bitmaps are emitted
+//!   as all-zero, which means the kernel would think every block
+//!   and inode is free even though some are in use. The kernel
+//!   will mount but `fsck` will flag the inconsistency. Bitmap
+//!   accounting lands when an allocator is needed (i.e. when we
+//!   start writing files into the image, not just creating it).
+//! - Journal (a JBD2-formatted file at a reserved inode).
+//! - Multiple block groups / large images.
+//! - `METADATA_CSUM` / `64BIT` features — produced images use
+//!   the simplest viable feature set so they round-trip cleanly
+//!   through the v0 decoders.
+//!
+//! What's enough for v0: produce something
+//! [`crate::Filesystem::open`] can consume,
+//! [`crate::Filesystem::read_inode(ROOT_INODE)`] can find as a
+//! directory, and [`crate::Filesystem::read_dir`] can walk into
+//! `[".", ".."]`. That's the round-trip demo this module is
+//! designed to deliver.
+
+use std::io::{Seek, SeekFrom, Write};
+
+use spec::{
+    DirEntry, Extent, ExtentHeader, GroupDescriptor, Inode, Superblock, INODE_FLAG_EXTENTS,
+    I_BLOCK_LEN, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+};
+
+use crate::error::Ext4Error;
+
+/// Configuration for [`format`]. Construct via [`Config::default`]
+/// for a 64 KiB image at 4 KiB blocks; tune the fields directly
+/// for other sizes.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Block size in bytes. Must be one of 1024, 2048, 4096,
+    /// 65536 (the same set the kernel accepts).
+    pub block_size: u32,
+
+    /// Total number of blocks in the image.
+    pub size_blocks: u32,
+
+    /// Volume label, truncated/padded to 16 bytes by [`format`].
+    /// Empty bytes (no label) are fine.
+    pub volume_label: Vec<u8>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            block_size: 4096,
+            size_blocks: 16,
+            volume_label: b"justext4".to_vec(),
+        }
+    }
+}
+
+/// Inodes per group. Hard-coded for v0 — single-group images
+/// don't need many inodes.
+const INODES_PER_GROUP: u32 = 32;
+
+/// Inode size on disk. Modern ext4 uses 256 bytes; rev-0 used
+/// 128. We pick 256 to match `mkfs.ext4` defaults.
+const INODE_SIZE: u16 = 256;
+
+/// Inode number reserved for the root directory by every ext-
+/// family filesystem.
+const ROOT_INODE_NUMBER: u32 = 2;
+
+/// Layout helpers — derived from a Config so the IO step doesn't
+/// have to recompute offsets inline.
+struct Layout {
+    block_size: u64,
+    inode_table_blocks: u64,
+    inode_table_first_block: u64,
+    root_dir_block: u64,
+    /// Number of blocks consumed by metadata + the root dir
+    /// data block. Free count subtracts this from total blocks.
+    metadata_blocks: u64,
+}
+
+impl Layout {
+    fn from_config(config: &Config) -> Result<Self, Ext4Error> {
+        if !matches!(config.block_size, 1024 | 2048 | 4096 | 65536) {
+            return Err(Ext4Error::InvalidLayout {
+                reason: "block_size must be 1024, 2048, 4096, or 65536",
+            });
+        }
+        let block_size = config.block_size as u64;
+        let inode_table_bytes = (INODES_PER_GROUP as u64) * (INODE_SIZE as u64);
+        let inode_table_blocks = inode_table_bytes.div_ceil(block_size);
+        // Layout (block index → contents):
+        //   0: padding + superblock (sb at byte 1024 within block)
+        //   1: GDT
+        //   2: block bitmap
+        //   3: inode bitmap
+        //   4 .. 4+inode_table_blocks: inode table
+        //   4+inode_table_blocks: root dir data
+        let inode_table_first_block = 4u64;
+        let root_dir_block = inode_table_first_block + inode_table_blocks;
+        let metadata_blocks = root_dir_block + 1;
+        if (config.size_blocks as u64) < metadata_blocks {
+            return Err(Ext4Error::InvalidLayout {
+                reason: "size_blocks too small for the metadata + root dir layout",
+            });
+        }
+        Ok(Layout {
+            block_size,
+            inode_table_blocks,
+            inode_table_first_block,
+            root_dir_block,
+            metadata_blocks,
+        })
+    }
+}
+
+/// Format a writer as a minimal valid ext4 image.
+///
+/// The writer should be empty (or its existing contents will be
+/// overwritten in the regions this function touches; bytes
+/// between writes are caller-owned). For an in-memory image use
+/// `std::io::Cursor::new(Vec::with_capacity(size))`; for a file
+/// use `OpenOptions::new().write(true).create(true).truncate(true)`.
+pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ext4Error> {
+    let layout = Layout::from_config(config)?;
+    let total_blocks = config.size_blocks as u64;
+
+    // ── superblock ─────────────────────────────────────────────
+    let mut volume_name = [0u8; 16];
+    let label_len = config.volume_label.len().min(16);
+    volume_name[..label_len].copy_from_slice(&config.volume_label[..label_len]);
+
+    let free_blocks = total_blocks - layout.metadata_blocks;
+    // free inodes = total - 1 (only root inode is allocated for
+    // v0 — the other reserved inode slots remain zeroed).
+    let free_inodes = INODES_PER_GROUP - 1;
+
+    let sb = Superblock {
+        block_size: config.block_size,
+        inodes_count: INODES_PER_GROUP,
+        blocks_count: total_blocks,
+        free_blocks_count: free_blocks,
+        free_inodes_count: free_inodes,
+        inode_size: INODE_SIZE,
+        rev_level: 1,
+        feature_compat: 0,
+        feature_incompat: 0,
+        feature_ro_compat: 0,
+        uuid: [0; 16],
+        volume_name,
+        desc_size: 0, // ignored when 64BIT is clear
+        first_data_block: 0,
+        blocks_per_group: config.size_blocks,
+        inodes_per_group: INODES_PER_GROUP,
+    };
+
+    // ── group descriptor (single entry) ────────────────────────
+    let gd = GroupDescriptor {
+        block_bitmap: 2,
+        inode_bitmap: 3,
+        inode_table: layout.inode_table_first_block,
+        free_blocks_count: free_blocks as u32,
+        free_inodes_count: free_inodes,
+        used_dirs_count: 1, // root
+        flags: 0,
+        checksum: 0,
+    };
+
+    // ── root inode ─────────────────────────────────────────────
+    // i_block holds the extent header + one leaf extent pointing
+    // at the root dir data block.
+    let mut root_block_bytes = [0u8; I_BLOCK_LEN];
+    let header = ExtentHeader {
+        entries: 1,
+        max: 4,
+        depth: 0,
+        generation: 0,
+    };
+    header.encode_into(&mut root_block_bytes[..12])?;
+    let extent = Extent {
+        logical_block: 0,
+        len: 1,
+        physical_block: layout.root_dir_block,
+        uninit: false,
+    };
+    extent.encode_into(&mut root_block_bytes[12..24])?;
+
+    let root_inode = Inode {
+        mode: 0o040755,
+        uid: 0,
+        gid: 0,
+        size: layout.block_size,
+        atime: 0,
+        ctime: 0,
+        mtime: 0,
+        dtime: 0,
+        // Two links: "." (self-link) and the parent's entry to
+        // this dir. For root, the parent entry is itself, so the
+        // count is 2.
+        links_count: 2,
+        // i_blocks is in 512-byte sectors when HUGE_FILE is clear.
+        // One filesystem block of `block_size` is `block_size / 512`
+        // sectors.
+        blocks_lo: (config.block_size / 512),
+        blocks_hi: 0,
+        flags: INODE_FLAG_EXTENTS,
+        block: root_block_bytes,
+        generation: 0,
+        file_acl_lo: 0,
+        file_acl_hi: 0,
+    };
+
+    // ── root directory entries ─────────────────────────────────
+    let dot = DirEntry {
+        inode: ROOT_INODE_NUMBER,
+        // 8-byte header + 1-byte name "." → 9, padded to 12.
+        rec_len: 12,
+        file_type_raw: 2, // EXT4_FT_DIR
+        name: b".".to_vec(),
+    };
+    let dotdot = DirEntry {
+        inode: ROOT_INODE_NUMBER, // root's parent is itself
+        // The last entry in a dir block absorbs the rest of the
+        // block — kernel invariant.
+        rec_len: (config.block_size - 12) as u16,
+        file_type_raw: 2,
+        name: b"..".to_vec(),
+    };
+
+    // ── encode + write ─────────────────────────────────────────
+    let mut sb_buf = vec![0u8; SUPERBLOCK_SIZE];
+    sb.encode_into(&mut sb_buf)?;
+    writer.seek(SeekFrom::Start(SUPERBLOCK_OFFSET))?;
+    writer.write_all(&sb_buf)?;
+
+    // GDT entry 0 at start of block 1.
+    let mut gd_buf = vec![0u8; 32];
+    gd.encode_into(&mut gd_buf, &sb)?;
+    writer.seek(SeekFrom::Start(layout.block_size))?;
+    writer.write_all(&gd_buf)?;
+
+    // Inode 2 at index 1 within the inode table.
+    let inode_offset = layout.inode_table_first_block * layout.block_size
+        + ((ROOT_INODE_NUMBER - 1) as u64) * (INODE_SIZE as u64);
+    let mut inode_buf = vec![0u8; INODE_SIZE as usize];
+    root_inode.encode_into(&mut inode_buf, &sb)?;
+    writer.seek(SeekFrom::Start(inode_offset))?;
+    writer.write_all(&inode_buf)?;
+
+    // Root dir data block: "." then "..".
+    let mut block_buf = vec![0u8; config.block_size as usize];
+    dot.encode_into(&mut block_buf[..12])?;
+    dotdot.encode_into(&mut block_buf[12..])?;
+    writer.seek(SeekFrom::Start(layout.root_dir_block * layout.block_size))?;
+    writer.write_all(&block_buf)?;
+
+    // Pad image up to total_blocks * block_size by writing one
+    // zero at the last byte. Required because mid-stream seeks
+    // don't extend the underlying buffer; a Filesystem::open on
+    // a short buffer would error on the read of metadata blocks
+    // that haven't been physically written.
+    let total_size = total_blocks * layout.block_size;
+    if total_size > 0 {
+        writer.seek(SeekFrom::Start(total_size - 1))?;
+        writer.write_all(&[0])?;
+    }
+    let _ = layout.inode_table_blocks; // silence unused-field warning
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::{Filesystem, ROOT_INODE};
+    use spec::InodeFileType;
+    use std::io::Cursor;
+
+    /// Format → open → read root: the round-trip demo. Our own
+    /// formatter produces an image our own opener can read.
+    ///
+    /// Bug it catches: any encode-side field-offset error
+    /// surfaces as either an open failure (bad magic / invalid
+    /// block size) or a wrong inode mode on read. Together with
+    /// the per-type round-trip tests in spec, this is the
+    /// integration test that proves the encode + decode sides
+    /// are consistent end-to-end.
+    #[test]
+    fn test_format_then_open_returns_root_directory_with_dot_dotdot_entries() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        let config = Config::default();
+        format(&mut cursor, &config).unwrap();
+
+        // The buffer now holds a valid ext4 image. Open it.
+        let mut fs = Filesystem::open(Cursor::new(buf)).unwrap();
+        assert_eq!(fs.superblock().block_size, 4096);
+        assert_eq!(fs.superblock().inodes_per_group, INODES_PER_GROUP);
+
+        let root = fs.read_inode(ROOT_INODE).unwrap();
+        assert_eq!(root.file_type(), InodeFileType::Directory);
+        assert_eq!(root.links_count, 2);
+        assert!(root.uses_extents());
+
+        let entries = fs.read_dir(&root).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[0].inode, ROOT_INODE);
+        assert_eq!(entries[1].name, b"..");
+        assert_eq!(entries[1].inode, ROOT_INODE);
+    }
+
+    /// `open_path("/")` over a freshly-formatted image returns
+    /// the root inode.
+    ///
+    /// Bug it catches: even if read_dir works, open_path could
+    /// fail if the formatter set `first_data_block` incorrectly,
+    /// or if any of the filesystem's chained calls (read_inode →
+    /// resolve_logical_block → read_file → decode_dir_block) fail
+    /// somewhere downstream of where the per-call tests look.
+    /// The integration test exercises the chain end-to-end.
+    #[test]
+    fn test_format_then_open_path_root_returns_root_inode() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(buf)).unwrap();
+        assert_eq!(fs.open_path("/").unwrap(), ROOT_INODE);
+    }
+
+    /// Format rejects a too-small image with InvalidLayout.
+    ///
+    /// Bug it catches: a formatter that silently truncates the
+    /// layout to fit a too-small request would produce an image
+    /// with overlapping metadata blocks (e.g. inode table on top
+    /// of the root dir data). The kernel would mount it and
+    /// return garbage; far worse than a clean refusal.
+    #[test]
+    fn test_format_too_small_image_rejected_with_invalid_layout() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        let config = Config {
+            size_blocks: 4, // not enough for inode table + root dir
+            ..Config::default()
+        };
+        let err = format(&mut cursor, &config).unwrap_err();
+        assert!(matches!(err, Ext4Error::InvalidLayout { .. }));
+    }
+
+    /// Format rejects an invalid block_size.
+    #[test]
+    fn test_format_invalid_block_size_rejected() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        let config = Config {
+            block_size: 8192, // not in {1024,2048,4096,65536}
+            ..Config::default()
+        };
+        let err = format(&mut cursor, &config).unwrap_err();
+        assert!(matches!(err, Ext4Error::InvalidLayout { .. }));
+    }
+
+    /// Volume label round-trips through format → open.
+    ///
+    /// Bug it catches: a label setter that writes to the wrong
+    /// offset or pads improperly would make `fs.superblock().
+    /// volume_label()` return the wrong string after format.
+    /// The label is operator-visible (mounted FS shows it), so
+    /// silent corruption here would be embarrassing.
+    #[test]
+    fn test_format_volume_label_round_trips_through_open() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        let config = Config {
+            volume_label: b"my-rootfs".to_vec(),
+            ..Config::default()
+        };
+        format(&mut cursor, &config).unwrap();
+        let fs = Filesystem::open(Cursor::new(buf)).unwrap();
+        assert_eq!(fs.superblock().volume_label(), "my-rootfs");
+    }
+}

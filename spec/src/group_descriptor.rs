@@ -164,6 +164,68 @@ impl GroupDescriptor {
     pub fn is_inode_uninit(&self) -> bool {
         self.flags & BG_FLAG_INODE_UNINIT != 0
     }
+
+    /// Serialise into the first `entry_size` bytes of `buf`,
+    /// matching the layout the decoder reads. The `sb` is
+    /// consulted for `entry_size`; on 64-bit images the hi-word
+    /// fields are emitted in addition to the lo halves.
+    ///
+    /// The bytes past the entry are caller-owned and untouched.
+    /// Bytes within the entry that this v0 layer doesn't know
+    /// about (`bg_exclude_bitmap_*`, csum fields,
+    /// `bg_itable_unused_*`) are zeroed so reserved slots don't
+    /// carry junk.
+    pub fn encode_into(
+        &self,
+        buf: &mut [u8],
+        sb: &Superblock,
+    ) -> Result<(), GroupDescriptorEncodeError> {
+        let entry_size = sb.group_descriptor_size() as usize;
+        if entry_size < 32 {
+            return Err(GroupDescriptorEncodeError::EntrySizeTooSmall {
+                size: entry_size as u16,
+            });
+        }
+        if buf.len() < entry_size {
+            return Err(GroupDescriptorEncodeError::OutputTooSmall {
+                actual: buf.len(),
+                expected: entry_size,
+            });
+        }
+        // Zero only the entry — leave bytes past it untouched.
+        buf[..entry_size].fill(0);
+
+        write_u32(buf, OFF_BLOCK_BITMAP_LO, self.block_bitmap as u32);
+        write_u32(buf, OFF_INODE_BITMAP_LO, self.inode_bitmap as u32);
+        write_u32(buf, OFF_INODE_TABLE_LO, self.inode_table as u32);
+        write_u16(buf, OFF_FREE_BLOCKS_COUNT_LO, self.free_blocks_count as u16);
+        write_u16(buf, OFF_FREE_INODES_COUNT_LO, self.free_inodes_count as u16);
+        write_u16(buf, OFF_USED_DIRS_COUNT_LO, self.used_dirs_count as u16);
+        write_u16(buf, OFF_FLAGS, self.flags);
+        write_u16(buf, OFF_CHECKSUM, self.checksum);
+
+        if entry_size >= 64 {
+            write_u32(buf, OFF_BLOCK_BITMAP_HI, (self.block_bitmap >> 32) as u32);
+            write_u32(buf, OFF_INODE_BITMAP_HI, (self.inode_bitmap >> 32) as u32);
+            write_u32(buf, OFF_INODE_TABLE_HI, (self.inode_table >> 32) as u32);
+            write_u16(
+                buf,
+                OFF_FREE_BLOCKS_COUNT_HI,
+                (self.free_blocks_count >> 16) as u16,
+            );
+            write_u16(
+                buf,
+                OFF_FREE_INODES_COUNT_HI,
+                (self.free_inodes_count >> 16) as u16,
+            );
+            write_u16(
+                buf,
+                OFF_USED_DIRS_COUNT_HI,
+                (self.used_dirs_count >> 16) as u16,
+            );
+        }
+        Ok(())
+    }
 }
 
 fn combine_addr(hi: u32, lo: u32) -> u64 {
@@ -185,6 +247,23 @@ fn read_u32(buf: &[u8], offset: usize) -> u32 {
         buf[offset + 2],
         buf[offset + 3],
     ])
+}
+
+fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
+    buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum GroupDescriptorEncodeError {
+    #[error("group descriptor entry size {size} is below the kernel minimum of 32")]
+    EntrySizeTooSmall { size: u16 },
+
+    #[error("output buffer too small: have {actual} bytes, expected {expected}")]
+    OutputTooSmall { actual: usize, expected: usize },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -363,5 +442,56 @@ mod tests {
         assert_eq!(gd.used_dirs_count, 0);
         assert_eq!(gd.flags, 0);
         assert_eq!(gd.checksum, 0);
+    }
+
+    /// Decode → encode → decode preserves every field on both
+    /// 32-byte and 64-byte entries.
+    ///
+    /// Bug it catches: any field-offset error in the encoder
+    /// surfaces because the second decode reads back from the
+    /// canonical offsets — a slip in encode either lands in the
+    /// wrong field (visible mismatch) or in a reserved offset
+    /// the decoder ignores (silent loss).
+    #[test]
+    fn test_encode_then_decode_preserves_every_field_32_byte() {
+        let sb = make_sb(0, 0);
+        let mut buf = vec![0u8; 32];
+        write_u32(&mut buf, OFF_BLOCK_BITMAP_LO, 0x1111_1111);
+        write_u32(&mut buf, OFF_INODE_BITMAP_LO, 0x2222_2222);
+        write_u32(&mut buf, OFF_INODE_TABLE_LO, 0x3333_3333);
+        write_u16(&mut buf, OFF_FREE_BLOCKS_COUNT_LO, 0x4444);
+        write_u16(&mut buf, OFF_FREE_INODES_COUNT_LO, 0x5555);
+        write_u16(&mut buf, OFF_USED_DIRS_COUNT_LO, 0x6666);
+        write_u16(&mut buf, OFF_FLAGS, BG_FLAG_BLOCK_UNINIT);
+        write_u16(&mut buf, OFF_CHECKSUM, 0xABCD);
+        let gd1 = GroupDescriptor::decode(&buf, &sb).unwrap();
+
+        let mut encoded = vec![0u8; 32];
+        gd1.encode_into(&mut encoded, &sb).unwrap();
+        let gd2 = GroupDescriptor::decode(&encoded, &sb).unwrap();
+        assert_eq!(gd1, gd2);
+    }
+
+    #[test]
+    fn test_encode_then_decode_preserves_every_field_64_byte() {
+        let sb = make_sb(FEATURE_INCOMPAT_64BIT, 64);
+        let mut buf = vec![0u8; 64];
+        write_u32(&mut buf, OFF_BLOCK_BITMAP_LO, 0x1111_1111);
+        write_u32(&mut buf, OFF_BLOCK_BITMAP_HI, 0x0000_0001);
+        write_u32(&mut buf, OFF_INODE_BITMAP_LO, 0x2222_2222);
+        write_u32(&mut buf, OFF_INODE_BITMAP_HI, 0x0000_0002);
+        write_u32(&mut buf, OFF_INODE_TABLE_LO, 0x3333_3333);
+        write_u32(&mut buf, OFF_INODE_TABLE_HI, 0x0000_0003);
+        write_u16(&mut buf, OFF_FREE_BLOCKS_COUNT_LO, 0x4444);
+        write_u16(&mut buf, OFF_FREE_BLOCKS_COUNT_HI, 0x0001);
+        write_u16(&mut buf, OFF_FREE_INODES_COUNT_LO, 0x5555);
+        write_u16(&mut buf, OFF_FREE_INODES_COUNT_HI, 0x0002);
+        write_u16(&mut buf, OFF_FLAGS, BG_FLAG_INODE_UNINIT);
+        let gd1 = GroupDescriptor::decode(&buf, &sb).unwrap();
+
+        let mut encoded = vec![0u8; 64];
+        gd1.encode_into(&mut encoded, &sb).unwrap();
+        let gd2 = GroupDescriptor::decode(&encoded, &sb).unwrap();
+        assert_eq!(gd1, gd2);
     }
 }
