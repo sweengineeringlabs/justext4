@@ -691,6 +691,103 @@ impl<R: Read + Seek> Filesystem<R> {
         Ok(())
     }
 
+    /// Remove an empty directory at `path`. Mirrors POSIX
+    /// `rmdir` semantics: the directory must be empty (only
+    /// `.` and `..`) and not the root.
+    ///
+    /// Frees the dir's inode + its single data block, removes
+    /// its dir entry from the parent, decrements the parent's
+    /// `links_count` (the removed dir's `..` was a link to
+    /// parent), and decrements the group's `used_dirs_count`.
+    ///
+    /// v0 limits inherited from `mkdir`: assumes the dir's
+    /// content lives in a single block.
+    pub fn rmdir(&mut self, path: &str) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let (parent_path, dirname) = Self::split_path(path)?;
+        let parent_inode_num = self.open_path(parent_path)?;
+        let mut parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: parent_inode_num,
+            });
+        }
+
+        let target_inode_num = self.lookup(&parent_inode, dirname.as_bytes())?;
+        if target_inode_num == ROOT_INODE {
+            // Defence in depth — even if the user tries
+            // rmdir("/.") the only way through here is to
+            // resolve "." inside root to ROOT_INODE itself,
+            // which would orphan the entire filesystem on
+            // success.
+            return Err(Ext4Error::DirectoryNotEmpty {
+                inode: target_inode_num,
+            });
+        }
+
+        let target_inode = self.read_inode(target_inode_num)?;
+        if !target_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: target_inode_num,
+            });
+        }
+
+        // Empty check: the only live entries must be `.` and
+        // `..`. Any other live name means the dir is in use.
+        let entries = self.read_dir(&target_inode)?;
+        let live_count = entries
+            .iter()
+            .filter(|e| !e.is_unused() && e.name != b"." && e.name != b"..")
+            .count();
+        if live_count != 0 {
+            return Err(Ext4Error::DirectoryNotEmpty {
+                inode: target_inode_num,
+            });
+        }
+
+        // Free the dir's data block(s). v0 only handles the
+        // single-block depth-0 case.
+        if target_inode.uses_extents() && target_inode.size > 0 {
+            let node = decode_extent_node(&target_inode.block)?;
+            if let ExtentNode::Leaf { extents, .. } = node {
+                for ext in extents {
+                    if !ext.uninit {
+                        self.free_blocks(ext.physical_block, ext.len as u32)?;
+                    }
+                }
+            }
+        }
+
+        self.free_inode(target_inode_num)?;
+
+        // Mark the inode deleted, same shape as unlink.
+        let mut deleted = target_inode;
+        deleted.links_count = 0;
+        deleted.dtime = 0x6500_0001;
+        deleted.size = 0;
+        deleted.flags = 0;
+        deleted.block = [0u8; I_BLOCK_LEN];
+        self.write_inode(target_inode_num, &deleted)?;
+
+        // Remove the dir entry from the parent.
+        self.remove_dir_entry(&parent_inode, target_inode_num, dirname.as_bytes())?;
+
+        // Reverse the bookkeeping mkdir did: parent loses a
+        // child link, group loses a directory.
+        if parent_inode.links_count > 0 {
+            parent_inode.links_count -= 1;
+        }
+        self.write_inode(parent_inode_num, &parent_inode)?;
+        if self.gdt[0].used_dirs_count > 0 {
+            self.gdt[0].used_dirs_count -= 1;
+        }
+
+        self.flush_metadata()?;
+        Ok(())
+    }
+
     /// Remove a regular file at `path`. Frees its inode + data
     /// blocks, removes its dir entry from the parent.
     ///

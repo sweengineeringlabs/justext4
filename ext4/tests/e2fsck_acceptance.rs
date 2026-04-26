@@ -424,3 +424,84 @@ fn test_format_then_create_file_then_unlink_passes_e2fsck_clean() {
         "e2fsck found a problem requiring fix after unlink"
     );
 }
+
+/// `format → mkdir → rmdir → e2fsck-clean`. Validates rmdir's
+/// reverse-mkdir bookkeeping against kernel-grade fsck.
+///
+/// Bug it catches: an rmdir that doesn't decrement the
+/// parent's links_count makes e2fsck flag a "Reference count
+/// wrong" in pass 4. An rmdir that doesn't decrement the
+/// group's used_dirs_count fails pass 5. An rmdir that frees
+/// the inode bitmap bit but leaves the dir entry in place
+/// fails pass 2.
+#[test]
+fn test_format_then_mkdir_then_rmdir_passes_e2fsck_clean() {
+    let runner = detect_runner();
+    if matches!(runner, E2fsckRunner::Unavailable) {
+        eprintln!(
+            "SKIP: e2fsck not on PATH and JUSTEXT4_E2FSCK_VIA_WSL not set; \
+             cannot validate post-rmdir image state"
+        );
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "justext4-e2fsck-rmdir-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("image.ext4");
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&img)
+        .unwrap();
+    format(&mut file, &Config::default()).unwrap();
+    drop(file);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img)
+        .unwrap();
+    let mut fs = Filesystem::open(file).unwrap();
+    fs.mkdir("/sub").unwrap();
+    fs.rmdir("/sub").unwrap();
+    drop(fs);
+
+    let mut cmd = build_command(&runner, &img);
+    eprintln!("running: {cmd:?}");
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn e2fsck");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- e2fsck stdout ---\n{stdout}");
+    eprintln!("--- e2fsck stderr ---\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "e2fsck rejected post-rmdir image (exit code: {:?})",
+        output.status.code()
+    );
+    assert!(
+        !stdout.contains("WARNING"),
+        "e2fsck flagged warnings after rmdir; links_count or used_dirs_count drift?"
+    );
+    assert!(
+        !stdout.contains("Fix?"),
+        "e2fsck found a problem requiring fix after rmdir"
+    );
+}

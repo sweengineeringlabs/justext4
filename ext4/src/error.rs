@@ -55,6 +55,13 @@ pub enum Ext4Error {
     #[error("is a directory: inode {inode}")]
     IsADirectory { inode: u32 },
 
+    /// `rmdir` was called on a directory that still contains
+    /// entries other than `.` and `..`. Mirrors POSIX
+    /// `ENOTEMPTY` semantics. The caller should `unlink` /
+    /// `rmdir` the inner entries first.
+    #[error("directory not empty: inode {inode}")]
+    DirectoryNotEmpty { inode: u32 },
+
     /// A creation operation found an entry already at the target
     /// name. Surfaces the colliding name so callers can prompt
     /// the user or pick a different filename.

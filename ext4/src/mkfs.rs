@@ -804,6 +804,102 @@ mod tests {
         assert_eq!(bytes, b"second version");
     }
 
+    /// `rmdir` removes an empty directory, frees its space,
+    /// and reverses the bookkeeping mkdir applied: parent's
+    /// links_count goes back down, group's used_dirs_count
+    /// goes back down.
+    ///
+    /// Bug it catches: an rmdir that doesn't decrement the
+    /// parent's links_count makes e2fsck flag a "Reference
+    /// count wrong" in pass 4 — the kernel would still mount
+    /// the FS but the count would be off by one for every
+    /// rmdir performed, accumulating until a sanity check
+    /// trips.
+    #[test]
+    fn test_mkdir_then_rmdir_returns_space_and_reverses_links() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        let free_inodes_before = fs.superblock().free_inodes_count;
+        let free_blocks_before = fs.superblock().free_blocks_count;
+        let root_links_before = fs.read_inode(ROOT_INODE).unwrap().links_count;
+
+        fs.mkdir("/sub").unwrap();
+        fs.rmdir("/sub").unwrap();
+
+        // Lookup must miss after rmdir.
+        let root = fs.read_inode(ROOT_INODE).unwrap();
+        let err = fs.lookup(&root, b"sub").unwrap_err();
+        assert!(matches!(err, Ext4Error::NotFound { .. }));
+
+        // Counters all reverted.
+        assert_eq!(fs.superblock().free_inodes_count, free_inodes_before);
+        assert_eq!(fs.superblock().free_blocks_count, free_blocks_before);
+        assert_eq!(root.links_count, root_links_before);
+    }
+
+    /// `rmdir` rejects a non-empty directory.
+    ///
+    /// Bug it catches: a removal that doesn't check the
+    /// emptiness invariant orphans every inner entry — the
+    /// inodes + blocks remain allocated but no path leads to
+    /// them. POSIX rmdir returns ENOTEMPTY for exactly this
+    /// reason; we mirror it as a typed Ext4Error::Directory-
+    /// NotEmpty so callers can route on it.
+    #[test]
+    fn test_rmdir_non_empty_directory_returns_directory_not_empty() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.mkdir("/etc").unwrap();
+        fs.create_file("/etc/hostname", b"host").unwrap();
+        let err = fs.rmdir("/etc").unwrap_err();
+        assert!(matches!(err, Ext4Error::DirectoryNotEmpty { .. }));
+    }
+
+    /// `rmdir` rejects a regular-file inode (mirror to unlink
+    /// rejecting dirs).
+    #[test]
+    fn test_rmdir_regular_file_returns_not_a_directory() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.create_file("/file", b"not a dir").unwrap();
+        let err = fs.rmdir("/file").unwrap_err();
+        assert!(matches!(err, Ext4Error::NotADirectory { .. }));
+    }
+
+    /// After `rmdir`, the freed inode + block can be reused by
+    /// a fresh mkdir of the same name. Proves bitmap clears
+    /// actually released space.
+    #[test]
+    fn test_rmdir_then_mkdir_same_name_succeeds() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.mkdir("/etc").unwrap();
+        fs.rmdir("/etc").unwrap();
+        let new_inode = fs.mkdir("/etc").unwrap();
+
+        let inode = fs.read_inode(new_inode).unwrap();
+        let entries = fs.read_dir(&inode).unwrap();
+        let names: Vec<&[u8]> = entries
+            .iter()
+            .filter(|e| !e.is_unused())
+            .map(|e| e.name.as_slice())
+            .collect();
+        assert!(names.iter().any(|n| *n == b"."));
+        assert!(names.iter().any(|n| *n == b".."));
+    }
+
     /// Volume label round-trips through format → open.
     ///
     /// Bug it catches: a label setter that writes to the wrong
