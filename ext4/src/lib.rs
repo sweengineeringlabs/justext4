@@ -12,5 +12,5 @@ pub mod filesystem;
 pub mod mkfs;
 
 pub use error::Ext4Error;
-pub use filesystem::{Filesystem, ROOT_INODE};
+pub use filesystem::{Filesystem, METADATA_CTIME, ROOT_INODE};
 pub use mkfs::{format, Config};

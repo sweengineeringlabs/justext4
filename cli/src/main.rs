@@ -6,7 +6,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use cli::{
-    cmd_build_from_tree, cmd_cat, cmd_format, cmd_inspect, cmd_touch, print_usage, CliError,
+    cmd_build_from_tree, cmd_cat, cmd_chmod, cmd_chown, cmd_format, cmd_inspect, cmd_touch,
+    cmd_utime, print_usage, CliError,
 };
 
 fn main() -> ExitCode {
@@ -21,6 +22,9 @@ fn main() -> ExitCode {
         Some("inspect") => cmd_inspect(&argv[2..], &mut out),
         Some("touch") => cmd_touch(&argv[2..], &mut out),
         Some("cat") => cmd_cat(&argv[2..], &mut out),
+        Some("chmod") => cmd_chmod(&argv[2..], &mut out),
+        Some("chown") => cmd_chown(&argv[2..], &mut out),
+        Some("utime") => cmd_utime(&argv[2..], &mut out),
         Some("build-from-tree") => cmd_build_from_tree(&argv[2..], &mut out),
         Some("--help") | Some("-h") | Some("help") | None => {
             let _ = print_usage(&mut err);

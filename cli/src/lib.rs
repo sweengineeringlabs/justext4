@@ -47,6 +47,12 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     writeln!(out, "  mkext4-rs inspect <path>")?;
     writeln!(out, "  mkext4-rs touch <image> <vfs-path> <content>")?;
     writeln!(out, "  mkext4-rs cat <image> <vfs-path>")?;
+    writeln!(out, "  mkext4-rs chmod <image> <vfs-path> <octal-mode>")?;
+    writeln!(out, "  mkext4-rs chown <image> <vfs-path> <uid> <gid>")?;
+    writeln!(
+        out,
+        "  mkext4-rs utime <image> <vfs-path> <atime-epoch> <mtime-epoch>"
+    )?;
     writeln!(
         out,
         "  mkext4-rs build-from-tree <host-dir> <image> [--size-blocks N] [--inodes N] [--label TEXT]"
@@ -369,6 +375,104 @@ pub fn cmd_build_from_tree<W: Write>(args: &[String], out: &mut W) -> Result<(),
     Ok(())
 }
 
+/// Mutate inode mode bits (POSIX `chmod`). Replaces the bottom
+/// 12 bits; preserves the file-type nibble.
+///
+/// Args: `<image> <vfs-path> <octal-mode>` — the mode is parsed
+/// as octal (`0755`, `755`, both work) per the unix tradition.
+pub fn cmd_chmod<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
+    if args.len() < 3 {
+        return Err(CliError(
+            "chmod requires <image> <vfs-path> <octal-mode>".to_string(),
+        ));
+    }
+    let host_path = &args[0];
+    let vfs_path = &args[1];
+    let mode_str = args[2].trim_start_matches('0');
+    let mode_str = if mode_str.is_empty() { "0" } else { mode_str };
+    let mode = u16::from_str_radix(mode_str, 8)
+        .map_err(|e| CliError(format!("chmod parse mode {:?}: {e}", args[2])))?;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new(host_path))
+        .map_err(|e| CliError(format!("open {host_path}: {e}")))?;
+    let mut fs = Filesystem::open(file).map_err(|e| CliError(format!("open: {e}")))?;
+    fs.chmod(vfs_path, mode)
+        .map_err(|e| CliError(format!("chmod: {e}")))?;
+    writeln!(out, "chmod {vfs_path} -> {:o}", mode).map_err(|e| CliError(format!("write: {e}")))?;
+    Ok(())
+}
+
+/// Mutate inode owner uid + gid (POSIX `chown`).
+///
+/// Args: `<image> <vfs-path> <uid> <gid>` — both ids are parsed
+/// as decimal `u32`; values above 65535 are written through the
+/// OSD2 high-word path.
+pub fn cmd_chown<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
+    if args.len() < 4 {
+        return Err(CliError(
+            "chown requires <image> <vfs-path> <uid> <gid>".to_string(),
+        ));
+    }
+    let host_path = &args[0];
+    let vfs_path = &args[1];
+    let uid = args[2]
+        .parse::<u32>()
+        .map_err(|e| CliError(format!("chown parse uid {:?}: {e}", args[2])))?;
+    let gid = args[3]
+        .parse::<u32>()
+        .map_err(|e| CliError(format!("chown parse gid {:?}: {e}", args[3])))?;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new(host_path))
+        .map_err(|e| CliError(format!("open {host_path}: {e}")))?;
+    let mut fs = Filesystem::open(file).map_err(|e| CliError(format!("open: {e}")))?;
+    fs.chown(vfs_path, uid, gid)
+        .map_err(|e| CliError(format!("chown: {e}")))?;
+    writeln!(out, "chown {vfs_path} -> uid={uid} gid={gid}")
+        .map_err(|e| CliError(format!("write: {e}")))?;
+    Ok(())
+}
+
+/// Mutate inode timestamps atime + mtime (POSIX `utime`). ctime
+/// is bumped by the underlying op per POSIX rules — callers don't
+/// supply it.
+///
+/// Args: `<image> <vfs-path> <atime-epoch> <mtime-epoch>` — both
+/// stamps are POSIX seconds (`u32`), matching ext4's
+/// resolution for v0.
+pub fn cmd_utime<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
+    if args.len() < 4 {
+        return Err(CliError(
+            "utime requires <image> <vfs-path> <atime-epoch> <mtime-epoch>".to_string(),
+        ));
+    }
+    let host_path = &args[0];
+    let vfs_path = &args[1];
+    let atime = args[2]
+        .parse::<u32>()
+        .map_err(|e| CliError(format!("utime parse atime {:?}: {e}", args[2])))?;
+    let mtime = args[3]
+        .parse::<u32>()
+        .map_err(|e| CliError(format!("utime parse mtime {:?}: {e}", args[3])))?;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new(host_path))
+        .map_err(|e| CliError(format!("open {host_path}: {e}")))?;
+    let mut fs = Filesystem::open(file).map_err(|e| CliError(format!("open: {e}")))?;
+    fs.utime(vfs_path, atime, mtime)
+        .map_err(|e| CliError(format!("utime: {e}")))?;
+    writeln!(out, "utime {vfs_path} -> atime={atime} mtime={mtime}")
+        .map_err(|e| CliError(format!("write: {e}")))?;
+    Ok(())
+}
+
 /// Read the contents of a file inside the image and write them
 /// verbatim to the writer.
 pub fn cmd_cat<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
@@ -574,5 +678,200 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains("unknown flag"));
+    }
+
+    /// Format → touch → chmod → re-open and read inode → mode
+    /// matches the supplied octal value with the file-type
+    /// nibble preserved.
+    ///
+    /// Bug it catches: end-to-end CLI flow for `chmod`. Catches
+    /// the same class of bug as the lib-level chmod test, but
+    /// also catches CLI-side mistakes — wrong octal-parse base,
+    /// wrong arg ordering, file handle not flushed before re-
+    /// open, etc.
+    #[test]
+    fn test_cli_format_then_touch_then_chmod_round_trips() {
+        let dir = Tempdir::new("chmod");
+        let img = dir.join("image.ext4");
+        let img_str = img.to_string_lossy().into_owned();
+
+        let mut sink = Vec::new();
+        cmd_format(std::slice::from_ref(&img_str), &mut sink).unwrap();
+        cmd_touch(
+            &[img_str.clone(), "/file.txt".into(), "data".into()],
+            &mut sink,
+        )
+        .unwrap();
+        cmd_chmod(
+            &[img_str.clone(), "/file.txt".into(), "0755".into()],
+            &mut sink,
+        )
+        .unwrap();
+
+        // Re-open and verify the on-disk mode.
+        let file = std::fs::File::open(&img).unwrap();
+        let mut fs = ext4::Filesystem::open(file).unwrap();
+        let inum = fs.open_path("/file.txt").unwrap();
+        let inode = fs.read_inode(inum).unwrap();
+        assert_eq!(
+            inode.mode, 0o100755,
+            "expected S_IFREG | 0o755 = 0o100755, got {:o}",
+            inode.mode
+        );
+    }
+
+    /// Format → touch → chown → re-open and read inode → uid
+    /// and gid match the supplied decimal values.
+    #[test]
+    fn test_cli_format_then_touch_then_chown_round_trips() {
+        let dir = Tempdir::new("chown");
+        let img = dir.join("image.ext4");
+        let img_str = img.to_string_lossy().into_owned();
+
+        let mut sink = Vec::new();
+        cmd_format(std::slice::from_ref(&img_str), &mut sink).unwrap();
+        cmd_touch(
+            &[img_str.clone(), "/file.txt".into(), "data".into()],
+            &mut sink,
+        )
+        .unwrap();
+        cmd_chown(
+            &[
+                img_str.clone(),
+                "/file.txt".into(),
+                "1000".into(),
+                "1001".into(),
+            ],
+            &mut sink,
+        )
+        .unwrap();
+
+        let file = std::fs::File::open(&img).unwrap();
+        let mut fs = ext4::Filesystem::open(file).unwrap();
+        let inum = fs.open_path("/file.txt").unwrap();
+        let inode = fs.read_inode(inum).unwrap();
+        assert_eq!(inode.uid, 1000, "uid must round-trip");
+        assert_eq!(inode.gid, 1001, "gid must round-trip");
+    }
+
+    /// Format → touch → utime → re-open and read inode →
+    /// atime + mtime match the supplied epoch values.
+    ///
+    /// Bug it catches: ordering mistake in CLI parsing (atime
+    /// and mtime swapped), missing file-handle flush, or the
+    /// underlying utime not bumping ctime — the assertion on
+    /// ctime catches the POSIX-rule violation directly.
+    #[test]
+    fn test_cli_format_then_touch_then_utime_round_trips() {
+        let dir = Tempdir::new("utime");
+        let img = dir.join("image.ext4");
+        let img_str = img.to_string_lossy().into_owned();
+
+        let mut sink = Vec::new();
+        cmd_format(std::slice::from_ref(&img_str), &mut sink).unwrap();
+        cmd_touch(
+            &[img_str.clone(), "/file.txt".into(), "data".into()],
+            &mut sink,
+        )
+        .unwrap();
+        cmd_utime(
+            &[
+                img_str.clone(),
+                "/file.txt".into(),
+                "1700000000".into(),
+                "1700001000".into(),
+            ],
+            &mut sink,
+        )
+        .unwrap();
+
+        let file = std::fs::File::open(&img).unwrap();
+        let mut fs = ext4::Filesystem::open(file).unwrap();
+        let inum = fs.open_path("/file.txt").unwrap();
+        let inode = fs.read_inode(inum).unwrap();
+        assert_eq!(inode.atime, 1_700_000_000, "atime round-trip");
+        assert_eq!(inode.mtime, 1_700_001_000, "mtime round-trip");
+        assert_eq!(
+            inode.ctime,
+            ext4::METADATA_CTIME,
+            "utime must still bump ctime per POSIX"
+        );
+    }
+
+    /// `chmod` with a missing arg surfaces a typed CliError
+    /// rather than a panic.
+    #[test]
+    fn test_cli_chmod_missing_args_returns_error() {
+        let mut sink = Vec::new();
+        let err = cmd_chmod(&["only-image".into()], &mut sink).unwrap_err();
+        assert!(
+            err.0.contains("requires"),
+            "expected 'requires' in error, got: {}",
+            err.0
+        );
+    }
+
+    /// `chown` with a non-numeric uid surfaces a typed parse
+    /// error rather than panicking.
+    #[test]
+    fn test_cli_chown_bad_uid_returns_error() {
+        let dir = Tempdir::new("chown-bad-uid");
+        let img = dir.join("image.ext4");
+        let img_str = img.to_string_lossy().into_owned();
+
+        let mut sink = Vec::new();
+        cmd_format(std::slice::from_ref(&img_str), &mut sink).unwrap();
+        cmd_touch(
+            &[img_str.clone(), "/file.txt".into(), "data".into()],
+            &mut sink,
+        )
+        .unwrap();
+        let err = cmd_chown(
+            &[
+                img_str,
+                "/file.txt".into(),
+                "not-a-number".into(),
+                "0".into(),
+            ],
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(
+            err.0.contains("parse uid"),
+            "expected 'parse uid' in error, got: {}",
+            err.0
+        );
+    }
+
+    /// `utime` with a non-numeric atime surfaces a typed parse
+    /// error rather than panicking.
+    #[test]
+    fn test_cli_utime_bad_atime_returns_error() {
+        let dir = Tempdir::new("utime-bad-atime");
+        let img = dir.join("image.ext4");
+        let img_str = img.to_string_lossy().into_owned();
+
+        let mut sink = Vec::new();
+        cmd_format(std::slice::from_ref(&img_str), &mut sink).unwrap();
+        cmd_touch(
+            &[img_str.clone(), "/file.txt".into(), "data".into()],
+            &mut sink,
+        )
+        .unwrap();
+        let err = cmd_utime(
+            &[
+                img_str,
+                "/file.txt".into(),
+                "not-a-number".into(),
+                "0".into(),
+            ],
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(
+            err.0.contains("parse atime"),
+            "expected 'parse atime' in error, got: {}",
+            err.0
+        );
     }
 }

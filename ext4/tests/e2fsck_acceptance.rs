@@ -771,3 +771,92 @@ fn test_format_then_rename_across_dirs_passes_e2fsck_clean() {
         "e2fsck found a problem requiring fix after rename"
     );
 }
+
+/// `format → create_file → chmod → chown → utime → e2fsck-clean`.
+/// Exercises all three inode-metadata mutation ops on the same
+/// file and validates the resulting image against kernel-grade
+/// fsck.
+///
+/// Bug it catches: a chmod / chown / utime that writes to the
+/// wrong byte offset (e.g. UID_HI written into BLOCKS_HI by a
+/// copy-paste slip) would corrupt unrelated inode fields. e2fsck
+/// flags as "Inode N has corrupt extent header" / "Inode N has
+/// imagic_fl set, but ..." in pass 1. A chmod that clobbers the
+/// file-type nibble fails pass 2's directory-entry-vs-inode
+/// type check. A utime that doesn't bump ctime is invisible to
+/// e2fsck (ctime values aren't validated), but the per-test
+/// assertion in `metadata_tests::test_utime_sets_atime_and_mtime`
+/// catches that one.
+#[test]
+fn test_format_then_chmod_chown_utime_passes_e2fsck_clean() {
+    let runner = detect_runner();
+    if matches!(runner, E2fsckRunner::Unavailable) {
+        eprintln!(
+            "SKIP: e2fsck not on PATH and JUSTEXT4_E2FSCK_VIA_WSL not set; \
+             cannot validate post-metadata-mutation image state"
+        );
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "justext4-e2fsck-meta-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("image.ext4");
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&img)
+        .unwrap();
+    format(&mut file, &Config::default()).unwrap();
+    drop(file);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img)
+        .unwrap();
+    let mut fs = Filesystem::open(file).unwrap();
+    fs.create_file("/file.txt", b"metadata-bench").unwrap();
+    fs.chmod("/file.txt", 0o600).unwrap();
+    fs.chown("/file.txt", 1000, 1000).unwrap();
+    fs.utime("/file.txt", 1_700_000_000, 1_700_001_000).unwrap();
+    drop(fs);
+
+    let mut cmd = build_command(&runner, &img);
+    eprintln!("running: {cmd:?}");
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn e2fsck");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- e2fsck stdout ---\n{stdout}");
+    eprintln!("--- e2fsck stderr ---\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "e2fsck rejected post-chmod/chown/utime image (exit code: {:?})",
+        output.status.code()
+    );
+    assert!(
+        !stdout.contains("WARNING"),
+        "e2fsck flagged warnings after metadata mutation; inode field offset slip?"
+    );
+    assert!(
+        !stdout.contains("Fix?"),
+        "e2fsck found a problem requiring fix after metadata mutation"
+    );
+}

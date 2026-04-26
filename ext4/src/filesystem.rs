@@ -1677,7 +1677,115 @@ impl<R: Read + Seek> Filesystem<R> {
         self.flush_metadata()?;
         Ok(())
     }
+
+    // ────────────────────────────────────────────────────────────
+    // Inode-metadata mutation ops: `chmod`, `chown`, `utime`.
+    //
+    // All three are read-modify-write of inode fields. They share
+    // the same shape — resolve path, read the inode, mutate one or
+    // more fields, bump ctime (POSIX rule: any inode mutation bumps
+    // ctime), write back. The shared body lives in `with_inode_mut`.
+    //
+    // Timestamps mutated by the metadata-bump path use
+    // `METADATA_CTIME` — a pinned epoch second so test images are
+    // byte-stable across runs (matches the existing convention from
+    // `unlink`/`rmdir` which use a pinned `dtime`). Real-world ports
+    // will feed in wall-clock time; v0 prefers reproducibility.
+    // ────────────────────────────────────────────────────────────
+    /// Resolve `path`, read the inode, hand it to `mutate`, bump
+    /// ctime to the pinned [`METADATA_CTIME`], and write the inode
+    /// back. The mutator returns nothing — the caller asserts the
+    /// shape of the change before this helper is invoked, so any
+    /// failure mode is the caller's to surface.
+    ///
+    /// Private — the public surface is the three op methods below.
+    fn with_inode_mut<F>(&mut self, path: &str, mutate: F) -> Result<(), Ext4Error>
+    where
+        R: Write,
+        F: FnOnce(&mut Inode),
+    {
+        let inode_num = self.open_path(path)?;
+        let mut inode = self.read_inode(inode_num)?;
+        mutate(&mut inode);
+        // POSIX: every inode mutation bumps ctime. Pinned for
+        // byte-stable images; production wrappers can reset to
+        // wall-clock if they want clock fidelity.
+        inode.ctime = METADATA_CTIME;
+        self.write_inode(inode_num, &inode)?;
+        Ok(())
+    }
+
+    /// Replace the bottom 12 bits of `inode.mode` (POSIX permission
+    /// bits + setuid/setgid/sticky) at `path` with `mode & 0o7777`.
+    ///
+    /// File-type bits (top 4 bits of mode) are preserved verbatim.
+    /// We mask both inputs explicitly:
+    /// - `mode & 0o7777` strips any caller-side leftover file-type
+    ///   bits (e.g. a caller who passed `0o100755` thinking they
+    ///   were OR-ing in mode bits — POSIX `chmod(2)` ignores
+    ///   anything above the bottom 12 bits, so we mirror that).
+    /// - `inode.mode & 0xF000` keeps only the file-type nibble of
+    ///   the existing mode. Any sticky/setuid bits the inode had
+    ///   are replaced — this matches POSIX `chmod` semantics
+    ///   (the new `mode` is *replacement*, not OR).
+    ///
+    /// Updates ctime to [`METADATA_CTIME`] per POSIX inode-mutation
+    /// rules.
+    pub fn chmod(&mut self, path: &str, mode: u16) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        self.with_inode_mut(path, |inode| {
+            // File-type nibble preserved; perm/setuid/setgid/sticky
+            // replaced by the bottom 12 bits of `mode`.
+            let file_type = inode.mode & 0xF000;
+            let perm = mode & 0o7777;
+            inode.mode = file_type | perm;
+        })
+    }
+
+    /// Set the inode's owner uid + gid at `path`. Both fields are
+    /// `u32` to honour the OSD2 hi+lo split — UIDs above 65535
+    /// round-trip correctly (encoder writes the high word into
+    /// `OFF_UID_HI`, decoder reassembles).
+    ///
+    /// Updates ctime to [`METADATA_CTIME`].
+    pub fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        self.with_inode_mut(path, |inode| {
+            inode.uid = uid;
+            inode.gid = gid;
+        })
+    }
+
+    /// Set the inode's atime + mtime at `path` to the supplied POSIX
+    /// epoch seconds. Mirrors `utime(2)` semantics (atime + mtime
+    /// only; ctime is the kernel's to control).
+    ///
+    /// ctime is bumped to [`METADATA_CTIME`] independently — POSIX
+    /// requires *any* inode mutation, including a `utime` that
+    /// changes only atime/mtime, to update ctime.
+    pub fn utime(&mut self, path: &str, atime: u32, mtime: u32) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        self.with_inode_mut(path, |inode| {
+            inode.atime = atime;
+            inode.mtime = mtime;
+        })
+    }
 }
+
+/// Pinned ctime stamp used by the metadata-mutation ops. Matches
+/// the convention of using a fixed-seconds value so produced
+/// images are byte-stable across runs (the unlink/rmdir paths
+/// already pin `dtime` for the same reason). Decimal value is
+/// 0x6500_0002 — distinct from the unlink/rmdir `0x6500_0001`
+/// dtime so a test reading both fields can tell which path
+/// touched the inode last.
+pub const METADATA_CTIME: u32 = 0x6500_0002;
 /// Join `parent_path` and `name` into a single absolute path, used
 /// by `rename`'s overwrite path to reconstruct a full path for
 /// `unlink`. `split_path` plus `open_path` together tolerate
