@@ -41,33 +41,34 @@ What's working:
 
 - **Read path**: superblock, group descriptors, inodes, extent trees,
   directory entries, file content, path resolution.
-- **Write path**: format empty images; `create_file` / `mkdir` /
-  `unlink` / `rmdir` / `symlink` (fast symlinks, target ≤ 60 bytes);
-  bitmap allocator; build-from-host-tree.
+- **Write path**: `format` / `create_file` / `mkdir` / `unlink` /
+  `rmdir` / `symlink` / `truncate` / `rename` / `chmod` / `chown` /
+  `utime`. Bitmap allocator. Build-from-host-tree.
 - **Kernel interop, both directions**: we read real `mkfs.ext4`
   output (committed fixture under `ext4/tests/fixtures/`), and our
   output passes `e2fsck -nf` clean and is mountable by the Linux
-  kernel via `mount -o loop` (verified end-to-end).
+  kernel via `mount -o loop` (verified end-to-end). The e2fsck
+  test runs on every CI push (Ubuntu has e2fsprogs preinstalled).
 - **Reproducibility**: same `Config` produces byte-identical output
   across runs (pinned timestamps + UUID + hash seed; pinned by an
   always-on test).
+- **Fuzz harness**: `fuzz/` sub-project with five `cargo-fuzz`
+  targets (one per spec-layer decoder). Run with
+  `cd fuzz && cargo +nightly fuzz run <target>`.
 
-What's not yet:
+What's not yet (each tracked as a GitHub issue):
 
-- `truncate`, `rename`, `chmod`/`chown`, `utime`, xattr,
-  append/write-into-existing-file
-- Long symlinks (target > 60 bytes) — v0 supports fast symlinks
-  only, where the target is stored inline in the inode's 60-byte
-  `i_block` field. Long symlinks would need an allocated data
-  block + extent tree; deferred until a real consumer needs it.
-- Symlink-following in `open_path` — `lstat` semantics only; v0
-  returns the symlink's own inode rather than chasing the target.
-- Multi-group images (single group only — caps at ~128 MiB at 4 KiB
-  blocks)
+- Long symlinks (target > 60 bytes — fast-symlink only today)
+- Symlink-following in `open_path` (lstat semantics, not stat)
+- Append / write-into-existing-file
+- xattr (extended attributes)
+- mknod / device files
+- Multi-group images (single group only — caps at ~128 MiB at
+  4 KiB blocks)
 - Block fragmentation (contiguous-only allocator)
 - Hash-tree directories (`EXT4_INDEX_FL`) — large dirs can't enumerate
 - Inline-data inodes (`INLINE_DATA` feature)
-- `METADATA_CSUM` / `64BIT` / journal features
+- JBD2 journal, `METADATA_CSUM`, `64BIT` features
 - crates.io publication
 
 ## Crates

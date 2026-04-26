@@ -20,7 +20,8 @@
 //! - We open + walk real `mke2fs`-produced images
 //!   (`tests/real_mkfs_roundtrip.rs`).
 //! - `e2fsck -nf` accepts our output as a clean filesystem
-//!   (`tests/e2fsck_acceptance.rs`, gated `#[ignore]`).
+//!   (`tests/e2fsck_acceptance.rs`, always-on, skip-passes when
+//!   `e2fsck` isn't on PATH; runs actively on Ubuntu CI).
 //! - The Linux kernel mounts our output as a real ext4
 //!   filesystem (manual verification: `mount -o loop ...`).
 //!
