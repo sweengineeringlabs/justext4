@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["spec"]
+
+[workspace.package]
+edition      = "2021"
+license      = "Apache-2.0"
+repository   = "https://github.com/sweengineeringlabs/justext4"
+authors      = ["SWE Engineering Labs"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+spec = { path = "spec", package = "swe_justext4_spec" }
+
+# External — kept minimal. ext4 on-disk format is a packed binary
+# layout; the toolbox is bytes, slicing, and integer math. Pulling
+# heavy crates in defeats the "primitive that other things depend on"
+# positioning.
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
