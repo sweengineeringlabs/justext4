@@ -213,8 +213,10 @@ pub fn cmd_touch<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError>
 /// Walk a host directory tree and replicate it inside the
 /// image. Subdirectories become ext4 dirs (`mkdir`); regular
 /// files become ext4 regular files with their content copied
-/// (`create_file`); other file types (symlinks, devices, sockets,
-/// fifos) are skipped with a warning.
+/// (`create_file`); symlinks become ext4 symlinks (`symlink`)
+/// when their target fits v0's fast-symlink inline limit (60
+/// bytes); other file types (devices, sockets, fifos) are
+/// skipped with a warning.
 ///
 /// Walks breadth-first via a stack so deeply nested trees don't
 /// blow the host stack — recursive `read_dir` would hit Rust's
@@ -261,6 +263,31 @@ pub fn populate_from_host_tree<R: std::io::Read + Write + std::io::Seek>(
                     .map_err(|e| CliError(format!("read {:?}: {e}", entry.path())))?;
                 fs.create_file(&vfs_child, &bytes)
                     .map_err(|e| CliError(format!("create_file {vfs_child}: {e}")))?;
+            } else if file_type.is_symlink() {
+                // Read the symlink's target and replicate it as
+                // an ext4 fast symlink. Targets are arbitrary
+                // bytes on Linux; on Windows `read_link` may
+                // give a path that loses information when
+                // converted via to_string_lossy, but for v0's
+                // fast-symlink store-target-bytes-verbatim the
+                // lossy conversion is the right trade — we want
+                // round-tripping a Linux tree through Windows
+                // not to fail on encoding.
+                let target = std::fs::read_link(entry.path())
+                    .map_err(|e| CliError(format!("read_link {:?}: {e}", entry.path())))?;
+                let target_bytes = target.to_string_lossy().into_owned().into_bytes();
+                match fs.symlink(&vfs_child, &target_bytes) {
+                    Ok(_) => {}
+                    Err(ext4::Ext4Error::SymlinkTargetTooLong { len }) => {
+                        eprintln!(
+                            "warning: skipping symlink {vfs_child}: target is {len} bytes; \
+                             v0 supports fast symlinks only (target <= 60 bytes)"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(CliError(format!("symlink {vfs_child}: {e}")));
+                    }
+                }
             } else {
                 eprintln!(
                     "warning: skipping {vfs_child}: file type {file_type:?} not supported in v0"

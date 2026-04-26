@@ -125,4 +125,17 @@ pub enum Ext4Error {
     /// during inode lookup.
     #[error("superblock layout invalid: {reason}")]
     InvalidLayout { reason: &'static str },
+
+    /// `symlink` was called with a target longer than v0's
+    /// fast-symlink inline limit. v0 stores the target verbatim
+    /// in the inode's 60-byte `i_block` field (no data block
+    /// allocation). Long symlinks (target > `I_BLOCK_LEN`
+    /// bytes) need an allocated data block + extent tree, which
+    /// is deferred to a follow-up slice.
+    ///
+    /// Surfacing the exact length lets callers report which
+    /// path was rejected and decide whether to fall back to a
+    /// regular file copy or skip the entry.
+    #[error("symlink target too long for v0 fast-symlink (got {len} bytes, limit is 60)")]
+    SymlinkTargetTooLong { len: usize },
 }

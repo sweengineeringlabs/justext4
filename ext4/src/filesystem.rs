@@ -228,6 +228,18 @@ impl<R: Read + Seek> Filesystem<R> {
     /// returns the raw concatenated directory blocks; consumers
     /// that want entries should use a directory-specific method.
     ///
+    /// Fast symlinks (file_type == Symlink, size <= [`I_BLOCK_LEN`])
+    /// store the target inline in `i_block` with no extent header
+    /// and no data blocks. We return those bytes directly. This
+    /// matters: a fast symlink's `i_block` is raw target bytes,
+    /// NOT an extent header, so trying to walk it as an extent
+    /// tree would either fail with a "bad magic" decode error or
+    /// — worse — find a coincidental 0xF30A in the target bytes
+    /// and produce nonsense. Long symlinks (target > 60 bytes)
+    /// would set `INODE_FLAG_EXTENTS` and fall through to the
+    /// extent walk like a regular file, but v0 doesn't produce
+    /// those (see [`Filesystem::symlink`] for the limit).
+    ///
     /// Inline-data inodes (`INODE_FLAG_INLINE_DATA`) are not yet
     /// supported. v0 of read_file treats them as having a size-0
     /// extent tree and returns whatever the empty walk yields,
@@ -237,6 +249,16 @@ impl<R: Read + Seek> Filesystem<R> {
         let size = inode.size as usize;
         if size == 0 {
             return Ok(Vec::new());
+        }
+
+        // Fast-symlink path: target stored inline in i_block, no
+        // extent header. The kernel uses `i_size <= 60 && !EXTENTS`
+        // as the discriminator; we match on the symlink file_type
+        // explicitly because v0's writer never sets EXTENTS for
+        // symlinks at all, and fast/slow split lands when long
+        // symlinks land.
+        if inode.is_symlink() && size <= I_BLOCK_LEN {
+            return Ok(inode.block[..size].to_vec());
         }
 
         let block_size = self.superblock.block_size as usize;
@@ -1078,6 +1100,122 @@ impl<R: Read + Seek> Filesystem<R> {
         )?;
 
         // Persist superblock + GDT counter changes.
+        self.flush_metadata()?;
+
+        Ok(new_inode_num)
+    }
+
+    /// Create a symbolic link at `link_path` whose target is the
+    /// raw byte string `target`. Returns the new symlink's inode
+    /// number.
+    ///
+    /// **v0 supports fast symlinks only.** The target is stored
+    /// inline in the inode's 60-byte `i_block` field — no data
+    /// block is allocated, no extent tree is built. Targets longer
+    /// than [`I_BLOCK_LEN`] bytes are rejected with
+    /// [`Ext4Error::SymlinkTargetTooLong`]; long-symlink support
+    /// (which would allocate a data block and set
+    /// `INODE_FLAG_EXTENTS`) lands when a real consumer needs it.
+    ///
+    /// Empty targets are rejected — POSIX `symlink(2)` returns
+    /// `ENOENT` for `target = ""`, and a zero-byte symlink is
+    /// useless in practice; e2fsck flags it as a corruption.
+    ///
+    /// Inode shape:
+    /// - `mode = 0o120777` (`S_IFLNK | 0o777`). Symlink permission
+    ///   bits aren't enforced by the kernel; this is the standard
+    ///   convention.
+    /// - `links_count = 1`. Symlinks (like regular files) only
+    ///   contribute to their parent's link count via the dir
+    ///   entry, not via a back-reference; `mkdir` is the only
+    ///   operation that bumps the parent's `links_count`.
+    /// - `size = target.len()` — this is how the kernel knows
+    ///   where the inline target ends.
+    /// - `flags = 0` — **no `INODE_FLAG_EXTENTS`**. For fast
+    ///   symlinks `i_block` holds raw target bytes, not an extent
+    ///   header. Setting EXTENTS would make readers try to decode
+    ///   the target as an extent tree.
+    /// - `block` — `target` bytes copied verbatim, zero-padded to
+    ///   the full 60 bytes.
+    /// - `blocks_lo = 0` — no allocated blocks.
+    ///
+    /// The dir entry is written with `file_type_raw = 7`
+    /// (`EXT4_FT_SYMLINK`) so directory walkers can route on type
+    /// without re-reading the inode.
+    ///
+    /// Rejects collisions with [`Ext4Error::AlreadyExists`].
+    /// Rejects a parent that isn't a directory with
+    /// [`Ext4Error::NotADirectory`].
+    pub fn symlink(&mut self, link_path: &str, target: &[u8]) -> Result<u32, Ext4Error>
+    where
+        R: Write,
+    {
+        if target.is_empty() {
+            // Mirror POSIX symlink(2)'s ENOENT — a zero-byte
+            // target is meaningless and e2fsck flags it as
+            // corruption ("Symlink ... has size 0").
+            return Err(Ext4Error::InvalidLayout {
+                reason: "symlink target must not be empty",
+            });
+        }
+        if target.len() > I_BLOCK_LEN {
+            return Err(Ext4Error::SymlinkTargetTooLong { len: target.len() });
+        }
+
+        let (parent_path, linkname) = Self::split_path(link_path)?;
+        let parent_inode_num = self.open_path(parent_path)?;
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: parent_inode_num,
+            });
+        }
+
+        // Reject collision so the caller can route on it. Mirrors
+        // create_file / mkdir — no silent overwrite.
+        match self.lookup(&parent_inode, linkname.as_bytes()) {
+            Ok(_) => {
+                return Err(Ext4Error::AlreadyExists {
+                    name: linkname.as_bytes().to_vec(),
+                });
+            }
+            Err(Ext4Error::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Allocate inode. NO data block — fast symlink stores the
+        // target inline in i_block.
+        let new_inode_num = self.allocate_inode()?;
+
+        // Build i_block: target bytes verbatim, zero-padded.
+        let mut block_bytes = [0u8; I_BLOCK_LEN];
+        block_bytes[..target.len()].copy_from_slice(target);
+
+        let new_inode = Inode {
+            mode: 0o120777, // S_IFLNK | 0o777 — kernel convention.
+            uid: 0,
+            gid: 0,
+            size: target.len() as u64,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            links_count: 1,
+            blocks_lo: 0, // No data blocks for a fast symlink.
+            blocks_hi: 0,
+            flags: 0, // **NOT** INODE_FLAG_EXTENTS — i_block is raw target bytes.
+            block: block_bytes,
+            generation: 0,
+            file_acl_lo: 0,
+            file_acl_hi: 0,
+        };
+        self.write_inode(new_inode_num, &new_inode)?;
+
+        // Add the dir entry. file_type_raw = 7 = EXT4_FT_SYMLINK.
+        self.add_dir_entry(&parent_inode, linkname.as_bytes(), new_inode_num, 7)?;
+
+        // Persist superblock + GDT counter changes (allocate_inode
+        // mutated free_inodes_count).
         self.flush_metadata()?;
 
         Ok(new_inode_num)

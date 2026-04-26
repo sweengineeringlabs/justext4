@@ -930,4 +930,138 @@ mod tests {
         let fs = Filesystem::open(Cursor::new(buf)).unwrap();
         assert_eq!(fs.superblock().volume_label(), "my-rootfs");
     }
+
+    /// `symlink` creates a fast-symlink inode with the target
+    /// stored inline in `i_block`, no data block allocated, and
+    /// `read_file` returns the target bytes verbatim.
+    ///
+    /// Bug it catches: a writer that sets `INODE_FLAG_EXTENTS`
+    /// and writes the target as if it were extent header bytes
+    /// would corrupt either the symlink (target lost to header
+    /// overhead) or the read path (read_file would try to walk
+    /// a non-extent i_block as an extent tree). Pinning that
+    /// the inode comes back as Symlink with size = target len
+    /// and the bytes round-trip catches both layout and decode
+    /// regressions in one assertion chain.
+    #[test]
+    fn test_symlink_creates_inode_with_inline_target() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        let target: &[u8] = b"/etc/hostname";
+        let inode_num = fs.symlink("/myhost", target).unwrap();
+
+        let inode = fs.read_inode(inode_num).unwrap();
+        assert!(inode.is_symlink());
+        assert_eq!(inode.file_type(), InodeFileType::Symlink);
+        assert_eq!(inode.size, target.len() as u64);
+        assert_eq!(inode.links_count, 1);
+        // Fast symlinks must NOT have the extents flag — i_block
+        // holds raw target bytes, not an extent header.
+        assert!(!inode.uses_extents());
+        // No data blocks allocated.
+        assert_eq!(inode.blocks_lo, 0);
+
+        // read_file on the symlink returns the target bytes
+        // (special-cased for fast symlinks).
+        let read_back = fs.read_file(&inode).unwrap();
+        assert_eq!(read_back, target);
+
+        // i_block holds the target verbatim, zero-padded.
+        assert_eq!(&inode.block[..target.len()], target);
+        assert!(inode.block[target.len()..].iter().all(|&b| b == 0));
+    }
+
+    /// `symlink` rejects targets longer than v0's 60-byte
+    /// fast-symlink limit with the typed error variant.
+    ///
+    /// Bug it catches: a writer that silently truncates the
+    /// target to 60 bytes would produce a working-looking
+    /// symlink that points at the wrong path. A writer that
+    /// silently overflows i_block into adjacent inode fields
+    /// would corrupt the inode's metadata (generation, file_acl
+    /// pointers). Both are silent-corruption-class bugs; the
+    /// typed error makes the limit explicit and routable.
+    #[test]
+    fn test_symlink_with_too_long_target_returns_typed_error() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        // 61 bytes — one past the inline limit.
+        let too_long = vec![b'a'; 61];
+        let err = fs.symlink("/long", &too_long).unwrap_err();
+        assert!(matches!(err, Ext4Error::SymlinkTargetTooLong { len: 61 }));
+
+        // Exactly 60 bytes is accepted.
+        let just_fits = vec![b'b'; 60];
+        let inode_num = fs.symlink("/fits", &just_fits).unwrap();
+        let inode = fs.read_inode(inode_num).unwrap();
+        assert_eq!(inode.size, 60);
+        assert_eq!(fs.read_file(&inode).unwrap(), just_fits);
+    }
+
+    /// `symlink` rejects creating a link whose name already
+    /// exists in the parent directory with `AlreadyExists`.
+    ///
+    /// Bug it catches: a creation that silently overwrites
+    /// would orphan the previous inode (its bitmap bit stays
+    /// set, the dir entry now points at the new symlink). This
+    /// is the same leak-class bug create_file/mkdir guard
+    /// against; the test pins that symlink follows the same
+    /// no-clobber discipline.
+    #[test]
+    fn test_symlink_collision_with_existing_entry_returns_already_exists() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.create_file("/foo", b"existing regular file").unwrap();
+        let err = fs.symlink("/foo", b"/elsewhere").unwrap_err();
+        assert!(matches!(err, Ext4Error::AlreadyExists { .. }));
+
+        // Symlink-vs-symlink collision also rejected.
+        fs.symlink("/link", b"/target").unwrap();
+        let err = fs.symlink("/link", b"/other").unwrap_err();
+        assert!(matches!(err, Ext4Error::AlreadyExists { .. }));
+    }
+
+    /// `open_path` on a symlink path returns the symlink's own
+    /// inode, NOT the inode the symlink points at. v0 doesn't
+    /// follow symlinks; that's a future slice.
+    ///
+    /// Bug it catches: a path resolver that auto-follows
+    /// symlinks would surprise callers that want the symlink's
+    /// metadata (e.g. an inspector listing what's in the
+    /// filesystem). The kernel's `lstat` semantics — return the
+    /// symlink itself — are what every shell tool's `ls -l`
+    /// expects. Pinning that we don't auto-follow keeps the API
+    /// honest about its scope.
+    #[test]
+    fn test_open_path_resolves_through_symlink_does_not_follow() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        // Real target file.
+        let target_inode = fs.create_file("/real.txt", b"real content").unwrap();
+        // Symlink pointing at the real file. The target string
+        // would matter only if we followed; we don't.
+        let symlink_inode = fs.symlink("/alias", b"/real.txt").unwrap();
+        assert_ne!(target_inode, symlink_inode);
+
+        let resolved = fs.open_path("/alias").unwrap();
+        // Returns the SYMLINK's inode, not the target's.
+        assert_eq!(resolved, symlink_inode);
+        assert_ne!(resolved, target_inode);
+
+        let inode = fs.read_inode(resolved).unwrap();
+        assert_eq!(inode.file_type(), InodeFileType::Symlink);
+        assert!(inode.is_symlink());
+    }
 }
