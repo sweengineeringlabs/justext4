@@ -34,6 +34,7 @@ const OFF_FEATURE_INCOMPAT: usize = 0x60;
 const OFF_FEATURE_RO_COMPAT: usize = 0x64;
 const OFF_UUID: usize = 0x68;
 const OFF_VOLUME_NAME: usize = 0x78;
+const OFF_DESC_SIZE: usize = 0xFE;
 const OFF_BLOCKS_COUNT_HI: usize = 0x150;
 const OFF_FREE_BLOCKS_COUNT_HI: usize = 0x154;
 
@@ -48,9 +49,16 @@ const REV_DYNAMIC: u32 = 1;
 const DEFAULT_INODE_SIZE: u16 = 128;
 
 /// `INCOMPAT_64BIT` — when set, total block count uses
-/// `s_blocks_count_hi` as the high 32 bits. Without this flag the
-/// hi word is reserved and must be ignored on read.
-const FEATURE_INCOMPAT_64BIT: u32 = 0x80;
+/// `s_blocks_count_hi` as the high 32 bits, and the group descriptor
+/// table uses 64-byte (rather than 32-byte) entries with hi/lo split
+/// addresses. Without this flag both hi words are reserved and must
+/// be ignored on read.
+pub const FEATURE_INCOMPAT_64BIT: u32 = 0x80;
+
+/// Group descriptor size when `INCOMPAT_64BIT` is *not* set. The
+/// kernel hard-codes this as `EXT4_MIN_DESC_SIZE`. Older ext2/3
+/// images and 32-bit ext4 images use it.
+pub const GDT_ENTRY_SIZE_32: u16 = 32;
 
 /// Decoded ext4 superblock — only the v0 fields. Fields the higher
 /// layers do not yet need (mount counts, last-write timestamps,
@@ -102,6 +110,12 @@ pub struct Superblock {
     /// Volume label, nul-padded. Use [`Superblock::volume_label`]
     /// for the human-readable form with the nul padding stripped.
     pub volume_name: [u8; 16],
+
+    /// Raw `s_desc_size` field (offset 0xFE). On non-64BIT images
+    /// this is reserved and ignored — use
+    /// [`Superblock::group_descriptor_size`] for the value the
+    /// kernel actually applies.
+    pub desc_size: u16,
 }
 
 impl Superblock {
@@ -178,7 +192,31 @@ impl Superblock {
             feature_ro_compat,
             uuid,
             volume_name,
+            desc_size: read_u16(buf, OFF_DESC_SIZE),
         })
+    }
+
+    /// True iff `INCOMPAT_64BIT` is set. 64-bit images use 64-byte
+    /// group descriptors with hi/lo split addresses and combine
+    /// `s_blocks_count_hi` into the total block count.
+    pub fn is_64bit(&self) -> bool {
+        (self.feature_incompat & FEATURE_INCOMPAT_64BIT) != 0
+    }
+
+    /// Group descriptor entry size in bytes, applying the kernel's
+    /// rule: 32 (`EXT4_MIN_DESC_SIZE`) on non-64BIT images, raw
+    /// `s_desc_size` on 64BIT images.
+    ///
+    /// The raw `desc_size` field is only valid when 64BIT is set;
+    /// on 32-bit images it's reserved and may contain stale bytes.
+    /// Routing the read through this method keeps callers off the
+    /// raw field.
+    pub fn group_descriptor_size(&self) -> u16 {
+        if self.is_64bit() {
+            self.desc_size
+        } else {
+            GDT_ENTRY_SIZE_32
+        }
     }
 
     /// Volume label as a `&str`, with trailing nul padding stripped.
@@ -447,5 +485,61 @@ mod tests {
         let buf = buf_with(EXT4_MAGIC, 2, 1, 0);
         let sb = Superblock::decode(&buf).unwrap();
         assert_eq!(sb.volume_label(), "");
+    }
+
+    /// `is_64bit()` is false when `INCOMPAT_64BIT` is clear.
+    ///
+    /// Bug it catches: callers that branch on `is_64bit()` (notably
+    /// the GDT decoder choosing 32-byte vs 64-byte entries) would
+    /// otherwise need to test the raw bit themselves and could pick
+    /// the wrong mask, especially since the bit value (0x80) is
+    /// easily confused with other feature bits.
+    #[test]
+    fn test_is_64bit_false_when_feature_clear() {
+        let buf = buf_with(EXT4_MAGIC, 2, 1, 0);
+        let sb = Superblock::decode(&buf).unwrap();
+        assert!(!sb.is_64bit());
+    }
+
+    /// `is_64bit()` is true when `INCOMPAT_64BIT` is set.
+    #[test]
+    fn test_is_64bit_true_when_feature_set() {
+        let buf = buf_with(EXT4_MAGIC, 2, 1, FEATURE_INCOMPAT_64BIT);
+        let sb = Superblock::decode(&buf).unwrap();
+        assert!(sb.is_64bit());
+    }
+
+    /// `group_descriptor_size()` returns 32 on non-64BIT images
+    /// even when the raw `s_desc_size` field is non-zero.
+    ///
+    /// Bug it catches: a parser that returns the raw `desc_size`
+    /// unconditionally would compute wrong-sized GDT entries on
+    /// 32-bit images where the field is reserved. With this rule,
+    /// the GDT decoder gets 32 (the kernel's `EXT4_MIN_DESC_SIZE`)
+    /// regardless of stale bytes in the reserved field.
+    #[test]
+    fn test_group_descriptor_size_returns_32_on_non_64bit_regardless_of_field() {
+        let mut buf = buf_with(EXT4_MAGIC, 2, 1, 0);
+        // Pollute the reserved s_desc_size field. Decoder must ignore
+        // it because the 64BIT feature bit is clear.
+        buf[OFF_DESC_SIZE..OFF_DESC_SIZE + 2].copy_from_slice(&64u16.to_le_bytes());
+        let sb = Superblock::decode(&buf).unwrap();
+        assert_eq!(sb.group_descriptor_size(), 32);
+    }
+
+    /// `group_descriptor_size()` returns the raw `s_desc_size` on
+    /// 64BIT images.
+    ///
+    /// Bug it catches: a parser that hard-codes 32 on the assumption
+    /// "every ext4 image uses 32-byte descriptors" misreads modern
+    /// 64-bit images where the GDT entries are 64 bytes. Every
+    /// hi-word field (block_bitmap_hi, inode_table_hi, etc.) would
+    /// be silently dropped.
+    #[test]
+    fn test_group_descriptor_size_returns_raw_field_on_64bit() {
+        let mut buf = buf_with(EXT4_MAGIC, 2, 1, FEATURE_INCOMPAT_64BIT);
+        buf[OFF_DESC_SIZE..OFF_DESC_SIZE + 2].copy_from_slice(&64u16.to_le_bytes());
+        let sb = Superblock::decode(&buf).unwrap();
+        assert_eq!(sb.group_descriptor_size(), 64);
     }
 }

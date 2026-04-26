@@ -9,8 +9,14 @@
 //! `bg_*` / `i_*` conventions where practical so cross-referencing
 //! the kernel source is straightforward.
 
+pub mod group_descriptor;
 pub mod superblock;
 
+pub use group_descriptor::{
+    GroupDescriptor, GroupDescriptorDecodeError, BG_FLAG_BLOCK_UNINIT, BG_FLAG_INODE_UNINIT,
+    BG_FLAG_INODE_ZEROED,
+};
 pub use superblock::{
-    Superblock, SuperblockDecodeError, EXT4_MAGIC, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+    Superblock, SuperblockDecodeError, EXT4_MAGIC, FEATURE_INCOMPAT_64BIT, GDT_ENTRY_SIZE_32,
+    SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
