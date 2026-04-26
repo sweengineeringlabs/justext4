@@ -2,18 +2,22 @@
 //! `e2fsck -nf` against it, assert the kernel-grade fsck accepts
 //! it without errors.
 //!
-//! Gated `#[ignore]` because it requires `e2fsck` on the host's
-//! PATH (typically via Linux or WSL on Windows). Run with:
+//! **Always-run, skip-pass mode.** The test runs as part of
+//! `cargo test` (no `#[ignore]`). When `e2fsck` is unavailable
+//! on the host, it prints `SKIP` to stderr and passes — same
+//! pattern justoci uses for its cosign-on-PATH probe. This
+//! keeps the load-bearing kernel-grade-output check in the
+//! default suite so regressions in `format()` get caught
+//! anywhere e2fsck *is* available, while still letting the
+//! test pass on a Windows dev box without WSL or a Linux box
+//! without e2fsprogs.
 //!
-//! ```bash
-//! cargo test -p swe_justext4_ext4 --test e2fsck_acceptance \
-//!     -- --ignored --nocapture
-//! ```
-//!
-//! On a Windows dev box, set `JUSTEXT4_E2FSCK_VIA_WSL=1` to wrap
-//! the call in `wsl -- bash -c`, translating the Windows tempdir
-//! path into `/mnt/c/...`. The test prints what it executed so
-//! a failure reads cleanly.
+//! Detection logic, in order:
+//!   1. `which e2fsck` succeeds → run it directly.
+//!   2. `JUSTEXT4_E2FSCK_VIA_WSL=1` env var is set → run via
+//!      `wsl -- e2fsck`, translating the Windows tempdir path
+//!      to `/mnt/c/...`.
+//!   3. Otherwise → print SKIP and pass.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -51,6 +55,55 @@ fn to_wsl_path(p: &Path) -> String {
     s.into_owned()
 }
 
+/// What we found when we tried to invoke e2fsck.
+enum E2fsckRunner {
+    /// Direct invocation — `e2fsck` is on PATH.
+    Direct,
+    /// Wrapped: `wsl -- e2fsck`, with the image path translated
+    /// to `/mnt/c/...`.
+    Wsl,
+    /// Couldn't find a way to invoke e2fsck on this host.
+    Unavailable,
+}
+
+fn detect_runner() -> E2fsckRunner {
+    // Prefer direct invocation when available.
+    if Command::new("e2fsck")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success() || s.code().is_some())
+        .unwrap_or(false)
+    {
+        return E2fsckRunner::Direct;
+    }
+    // Fall back to WSL only when explicitly opted into. We
+    // don't auto-spawn WSL because invoking it on a fresh
+    // Windows install can be slow + interactive, which would
+    // make the default test run flaky.
+    if std::env::var("JUSTEXT4_E2FSCK_VIA_WSL").as_deref() == Ok("1") {
+        return E2fsckRunner::Wsl;
+    }
+    E2fsckRunner::Unavailable
+}
+
+fn build_command(runner: &E2fsckRunner, img: &Path) -> Command {
+    match runner {
+        E2fsckRunner::Direct => {
+            let mut c = Command::new("e2fsck");
+            c.arg("-nf").arg(img);
+            c
+        }
+        E2fsckRunner::Wsl => {
+            let mut c = Command::new("wsl");
+            c.arg("--").arg("e2fsck").arg("-nf").arg(to_wsl_path(img));
+            c
+        }
+        E2fsckRunner::Unavailable => unreachable!("caller checks for Unavailable"),
+    }
+}
+
 /// `e2fsck -nf` on a fresh `format()` image returns exit code 0
 /// with no errors or warnings. Proves the kernel-grade fsck
 /// accepts our output as a valid ext4 filesystem.
@@ -61,22 +114,25 @@ fn to_wsl_path(p: &Path) -> String {
 /// padding errors, free-count discrepancies) surfaces here as
 /// an e2fsck warning. The unit tests can't catch these because
 /// they only round-trip through our own decoder.
+///
+/// Skip-pass mode: prints `SKIP` and returns Ok when e2fsck
+/// isn't reachable on the host. This keeps the test in the
+/// default suite without making `cargo test` fail on a
+/// developer box that doesn't have e2fsprogs installed.
 #[test]
-#[ignore]
 fn test_format_output_passes_e2fsck_clean() {
-    let img = write_fresh_image();
-    let via_wsl = std::env::var("JUSTEXT4_E2FSCK_VIA_WSL").as_deref() == Ok("1");
+    let runner = detect_runner();
+    if matches!(runner, E2fsckRunner::Unavailable) {
+        eprintln!(
+            "SKIP: e2fsck not on PATH and JUSTEXT4_E2FSCK_VIA_WSL not set; \
+             cannot validate kernel-grade format() output here"
+        );
+        return;
+    }
 
-    let mut cmd = if via_wsl {
-        let mut c = Command::new("wsl");
-        c.arg("--").arg("e2fsck").arg("-nf").arg(to_wsl_path(&img));
-        c
-    } else {
-        let mut c = Command::new("e2fsck");
-        c.arg("-nf").arg(&img);
-        c
-    };
-    println!("running: {cmd:?}");
+    let img = write_fresh_image();
+    let mut cmd = build_command(&runner, &img);
+    eprintln!("running: {cmd:?}");
 
     let output = cmd
         .stdout(Stdio::piped())
@@ -86,8 +142,8 @@ fn test_format_output_passes_e2fsck_clean() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    println!("--- e2fsck stdout ---\n{stdout}");
-    println!("--- e2fsck stderr ---\n{stderr}");
+    eprintln!("--- e2fsck stdout ---\n{stdout}");
+    eprintln!("--- e2fsck stderr ---\n{stderr}");
 
     // Cleanup before assertions so a panicking test doesn't leak.
     let _ = std::fs::remove_dir_all(img.parent().unwrap());
