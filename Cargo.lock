@@ -21,6 +21,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "swe_justext4_cli"
+version = "0.1.0"
+dependencies = [
+ "swe_justext4_ext4",
+ "swe_justext4_spec",
+]
+
+[[package]]
 name = "swe_justext4_ext4"
 version = "0.1.0"
 dependencies = [

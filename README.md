@@ -19,18 +19,58 @@ This is a primitive, not an application. Consumers:
 
 ## Status
 
-Pre-v0. Superblock decoding is the first vertical slice. Read API
-lands before write. Out of scope for v0: JBD2 journal replay, online
-operations, resize / fsck / defragment.
+Working v0. Round-trip demo passes — format an empty image, write a
+file, read the bytes back, all in process:
+
+```rust
+use std::io::Cursor;
+use ext4::{format, Config, Filesystem};
+
+let mut img: Vec<u8> = Vec::new();
+format(&mut Cursor::new(&mut img), &Config::default())?;
+
+let mut fs = Filesystem::open(Cursor::new(&mut img))?;
+fs.create_file("/hello.txt", b"hello, ext4!")?;
+
+let inode_num = fs.open_path("/hello.txt")?;
+let inode = fs.read_inode(inode_num)?;
+assert_eq!(fs.read_file(&inode)?, b"hello, ext4!");
+```
+
+What's working:
+
+- **Read path**: superblock, group descriptors, inodes, extent trees,
+  directory entries, file content, path resolution.
+- **Write path**: format an empty image, create regular files, allocate
+  inodes + data blocks, populate bitmaps correctly.
+
+What's not yet:
+
+- `mkdir`, `unlink`, `truncate`, `rename`, symlinks
+- Multi-group images (single group only)
+- Block fragmentation (contiguous block allocation only)
+- Hash-tree directories (`EXT4_INDEX_FL`)
+- Inline-data inodes (`INLINE_DATA` feature)
+- Real `mkfs.ext4` fixture round-trip (we test against our own
+  formatter today; kernel-mountability not yet verified)
+- `METADATA_CSUM` / `64BIT` / journal features
 
 ## Crates
 
 | Crate                | Role                                                           |
 |----------------------|----------------------------------------------------------------|
-| `swe_justext4_spec`  | On-disk format types — superblock, group descriptor, inode, extent, dirent. Pure structs + decode/encode. No IO. |
+| `swe_justext4_spec`  | On-disk format types — superblock, group descriptor, inode, extent, dir entry, bitmap helpers. Pure structs + decode/encode. No IO. |
+| `swe_justext4_ext4`  | Read + write API. `Filesystem::open` for existing images, `mkfs::format` to create new ones, `create_file` / `read_file` / `read_dir` / `open_path` for content traversal. |
+| `swe_justext4_cli`   | `mkext4-rs` operator binary. Format, inspect, touch, cat. |
 
-`swe_justext4_ext4` (read + write API) and `swe_justext4_cli`
-(`mkext4-rs` operator binary) land as the spec layer firms up.
+## CLI
+
+```
+mkext4-rs format <path> [--size-blocks N] [--block-size N] [--label TEXT]
+mkext4-rs inspect <path>
+mkext4-rs touch <image> <vfs-path> <content>
+mkext4-rs cat <image> <vfs-path>
+```
 
 ## Sibling repos
 

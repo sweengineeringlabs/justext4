@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["spec", "ext4"]
+members = ["spec", "ext4", "cli"]
 
 [workspace.package]
 edition      = "2021"

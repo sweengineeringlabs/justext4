@@ -1,0 +1,24 @@
+[package]
+name        = "swe_justext4_cli"
+version     = "0.1.0"
+description = "mkext4-rs — operator CLI on top of swe_justext4_ext4. Format, inspect, touch, cat ext4 images entirely in pure Rust."
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mkext4-rs"
+path = "src/main.rs"
+
+[lib]
+name = "cli"
+path = "src/lib.rs"
+
+[dependencies]
+ext4 = { workspace = true }
+spec = { workspace = true }
+
+[lints]
+workspace = true
