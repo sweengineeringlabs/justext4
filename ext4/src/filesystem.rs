@@ -3,9 +3,14 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use spec::{
-    decode_extent_node, ExtentNode, GroupDescriptor, Inode, Superblock, SUPERBLOCK_OFFSET,
-    SUPERBLOCK_SIZE,
+    decode_dir_block, decode_extent_node, DirEntry, ExtentNode, GroupDescriptor, Inode, Superblock,
+    SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
+
+/// Inode number of the root directory. The kernel reserves
+/// inode 2 for `/`; smaller numbers are bad-blocks/boot-loader/
+/// etc.
+pub const ROOT_INODE: u32 = 2;
 
 use crate::error::Ext4Error;
 
@@ -263,6 +268,68 @@ impl<R: Read + Seek> Filesystem<R> {
 
         data.truncate(size);
         Ok(data)
+    }
+
+    /// Read the full set of entries from a directory inode.
+    ///
+    /// Reads the directory's data via `read_file` (treating it as
+    /// the byte stream it is on disk), then walks the buffer with
+    /// the spec-layer dir-entry decoder. Hash-tree directories
+    /// (`EXT4_INDEX_FL` flag on the inode) are walked as if they
+    /// were linear; for v0 this gives correct top-of-dir entries
+    /// (`.`, `..`, and any names the kernel happened to keep in
+    /// the linear part) but won't enumerate the full set.
+    /// True hash-tree walking lands in a follow-up.
+    ///
+    /// No `is_directory()` check is performed — the caller picks
+    /// the inode and bears the consequence of passing a non-dir.
+    /// In practice, decode_dir_block will surface a typed error
+    /// when the bytes don't parse as dir entries. The safety net
+    /// is in `open_path`, which checks file type before recursing.
+    pub fn read_dir(&mut self, inode: &Inode) -> Result<Vec<DirEntry>, Ext4Error> {
+        let bytes = self.read_file(inode)?;
+        Ok(decode_dir_block(&bytes)?)
+    }
+
+    /// Look up a child entry by name in `parent_inode`. Returns
+    /// the child's inode number on hit, `NotFound` on miss.
+    /// Unused entries (`inode = 0` tombstones) are skipped.
+    pub fn lookup(&mut self, parent_inode: &Inode, name: &[u8]) -> Result<u32, Ext4Error> {
+        let entries = self.read_dir(parent_inode)?;
+        for entry in entries {
+            if entry.is_unused() {
+                continue;
+            }
+            if entry.name == name {
+                return Ok(entry.inode);
+            }
+        }
+        Err(Ext4Error::NotFound {
+            name: name.to_vec(),
+        })
+    }
+
+    /// Resolve an absolute path to an inode number. Walks
+    /// component-by-component starting at the root inode (`/`).
+    /// `path = "/"` returns [`ROOT_INODE`]. Empty components from
+    /// double-slashes (`"/a//b"`) are tolerated.
+    ///
+    /// Symbolic links are NOT followed — the inode returned for
+    /// a symlink component is the symlink itself. Symlink chasing
+    /// lands when the higher-level path API needs it.
+    pub fn open_path(&mut self, path: &str) -> Result<u32, Ext4Error> {
+        let mut current = ROOT_INODE;
+        for component in path.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            let parent = self.read_inode(current)?;
+            if !parent.is_directory() {
+                return Err(Ext4Error::NotADirectory { inode: current });
+            }
+            current = self.lookup(&parent, component.as_bytes())?;
+        }
+        Ok(current)
     }
 }
 
@@ -667,6 +734,52 @@ mod tests {
         buf[off..off + data.len()].copy_from_slice(data);
     }
 
+    /// Write a sequence of directory entries into a single
+    /// physical block. The last entry's `rec_len` absorbs the
+    /// rest of the block (the kernel's invariant). Each entry is
+    /// `(inode_number, name_bytes, file_type_byte)`.
+    fn write_dir_entries_at_block(
+        buf: &mut [u8],
+        physical_block: u64,
+        entries: &[(u32, &[u8], u8)],
+    ) {
+        let block_off = physical_block as usize * BLOCK_SIZE;
+        let n = entries.len();
+        let mut cursor = 0usize;
+        for (i, (inode, name, ftype)) in entries.iter().enumerate() {
+            let payload = 8 + name.len();
+            let padded = payload.div_ceil(4) * 4;
+            let rec_len = if i == n - 1 {
+                BLOCK_SIZE - cursor
+            } else {
+                padded
+            };
+            let off = block_off + cursor;
+            write_u32(buf, off, *inode);
+            write_u16(buf, off + 4, rec_len as u16);
+            buf[off + 6] = name.len() as u8;
+            buf[off + 7] = *ftype;
+            buf[off + 8..off + 8 + name.len()].copy_from_slice(name);
+            cursor += rec_len;
+        }
+    }
+
+    /// Configure the root inode (inode 2) as a directory backed
+    /// by `num_blocks` contiguous physical blocks starting at
+    /// `start_block`. The caller is responsible for filling the
+    /// data blocks with valid dir entries — typically via
+    /// [`write_dir_entries_at_block`].
+    fn setup_root_as_directory(buf: &mut [u8], start_block: u64, num_blocks: u16) {
+        let inode_off = inode_byte_offset(2);
+        let total_size = (num_blocks as u32) * (BLOCK_SIZE as u32);
+        write_u16(buf, inode_off + I_MODE, 0o040755);
+        write_u32(buf, inode_off + I_SIZE_LO, total_size);
+        write_u16(buf, inode_off + I_LINKS_COUNT, 2);
+        write_u32(buf, inode_off + I_FLAGS, EXTENT_FLAG);
+        write_extent_header(buf, inode_off + I_BLOCK, 1, 4, 0);
+        write_extent_leaf(buf, inode_off + I_BLOCK + 12, 0, num_blocks, start_block);
+    }
+
     /// `read_file` on a zero-size inode returns an empty Vec, no
     /// IO performed.
     ///
@@ -828,6 +941,237 @@ mod tests {
         assert_eq!(data.len(), BLOCK_SIZE + 5);
         assert_eq!(&data[..BLOCK_SIZE], &block_a[..]);
         assert_eq!(&data[BLOCK_SIZE..], b"abcde");
+    }
+
+    /// `read_dir` on a single-block directory returns every
+    /// entry the block contains.
+    ///
+    /// Bug it catches: a reader that stops after the first entry
+    /// (forgetting to step by rec_len to find the next) would
+    /// only ever return ".", missing every other name in the
+    /// directory.
+    #[test]
+    fn test_read_dir_single_block_returns_all_entries() {
+        let mut img = build_image(0o040755, 2);
+        // Root dir backed by physical block 6.
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(
+            &mut img,
+            6,
+            &[
+                (2, b".", 2),      // dir
+                (2, b"..", 2),     // dir
+                (11, b"hello", 1), // regular file
+            ],
+        );
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let root = fs.read_inode(2).unwrap();
+        let entries = fs.read_dir(&root).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, b".");
+        assert_eq!(entries[1].name, b"..");
+        assert_eq!(entries[2].name, b"hello");
+        assert_eq!(entries[2].inode, 11);
+    }
+
+    /// `read_dir` walks across a block boundary — each block is
+    /// independently padded so the walk lands exactly on the
+    /// next block's first entry.
+    ///
+    /// Bug it catches: a walker that doesn't honour the per-
+    /// block "last entry absorbs remainder" invariant (and just
+    /// concatenates entries without padding) would lose
+    /// alignment on multi-block directories. The kernel relies
+    /// on this padding for hash-tree directories — every block
+    /// is its own self-contained chunk. Without proper handling,
+    /// the walk would either skip entries or decode block 1's
+    /// first entry from a misaligned offset inside block 0.
+    #[test]
+    fn test_read_dir_walks_across_block_boundary() {
+        let mut img = build_image(0o040755, 2);
+        // Root dir backed by 2 contiguous blocks at physical 6-7.
+        setup_root_as_directory(&mut img, 6, 2);
+        write_dir_entries_at_block(
+            &mut img,
+            6,
+            &[(2, b".", 2), (2, b"..", 2), (11, b"alpha", 1)],
+        );
+        write_dir_entries_at_block(
+            &mut img,
+            7,
+            &[(12, b"beta", 1), (13, b"gamma", 1), (14, b"delta", 1)],
+        );
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let root = fs.read_inode(2).unwrap();
+        let entries = fs.read_dir(&root).unwrap();
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[2].name, b"alpha");
+        assert_eq!(entries[3].name, b"beta");
+        assert_eq!(entries[5].name, b"delta");
+    }
+
+    /// `lookup` returns the matched entry's inode number.
+    ///
+    /// Bug it catches: a lookup that compares names with `==`
+    /// against `&str` instead of byte-slice would either fail
+    /// to match valid names containing non-UTF-8 bytes, or
+    /// allocate per-name during the walk. The byte-slice
+    /// comparison is the correct and cheap path.
+    #[test]
+    fn test_lookup_existing_entry_returns_inode_number() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(
+            &mut img,
+            6,
+            &[(2, b".", 2), (2, b"..", 2), (11, b"hello", 1)],
+        );
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let root = fs.read_inode(2).unwrap();
+        assert_eq!(fs.lookup(&root, b"hello").unwrap(), 11);
+    }
+
+    /// `lookup` returns NotFound for a missing entry.
+    ///
+    /// Bug it catches: a lookup that returns the last entry on a
+    /// miss (e.g. accumulating into a variable that's never
+    /// reset) would silently substitute one file for another —
+    /// a serious correctness bug in any path resolution.
+    #[test]
+    fn test_lookup_missing_entry_returns_not_found() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(
+            &mut img,
+            6,
+            &[(2, b".", 2), (2, b"..", 2), (11, b"hello", 1)],
+        );
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let root = fs.read_inode(2).unwrap();
+        let err = fs.lookup(&root, b"missing").unwrap_err();
+        assert!(matches!(err, Ext4Error::NotFound { .. }));
+    }
+
+    /// `lookup` skips unused (inode=0) tombstone entries.
+    ///
+    /// Bug it catches: a lookup that returns the first
+    /// name-matching entry without checking `is_unused()` could
+    /// return inode 0 — a sentinel the kernel reserves for "no
+    /// inode". Reads of inode 0 would fail downstream, but the
+    /// confusion at the failure point would mislead any
+    /// debugging.
+    #[test]
+    fn test_lookup_skips_unused_tombstone_entries() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(
+            &mut img,
+            6,
+            &[
+                (2, b".", 2),
+                (2, b"..", 2),
+                (0, b"hello", 1),  // tombstone — must be skipped
+                (11, b"hello", 1), // real entry
+            ],
+        );
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let root = fs.read_inode(2).unwrap();
+        assert_eq!(fs.lookup(&root, b"hello").unwrap(), 11);
+    }
+
+    /// `open_path("/")` returns the root inode number.
+    ///
+    /// Bug it catches: a parser that requires a non-empty
+    /// component would fail on the empty path "/" — the most
+    /// common path of all. Kicking in only on root path is a
+    /// real-world bug class for naive split-on-'/' code.
+    #[test]
+    fn test_open_path_root_returns_root_inode() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(&mut img, 6, &[(2, b".", 2), (2, b"..", 2)]);
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        assert_eq!(fs.open_path("/").unwrap(), ROOT_INODE);
+    }
+
+    /// `open_path("/name")` walks one level and returns the
+    /// child inode.
+    ///
+    /// Bug it catches: starting at the wrong inode (e.g. inode
+    /// 1, the bad-blocks reservation, instead of inode 2) would
+    /// fail every path read — but with confusing "not a
+    /// directory" or "decode error" messages instead of "your
+    /// path is wrong".
+    #[test]
+    fn test_open_path_one_level_returns_child_inode() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(&mut img, 6, &[(2, b".", 2), (2, b"..", 2), (11, b"foo", 1)]);
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        assert_eq!(fs.open_path("/foo").unwrap(), 11);
+    }
+
+    /// `open_path` on a non-directory parent returns
+    /// NotADirectory with the offending inode number.
+    ///
+    /// Bug it catches: a path walker that doesn't check file
+    /// type on intermediate components would happily try to
+    /// decode a regular file's bytes as a directory block,
+    /// returning either gibberish entries or a decode error
+    /// without the diagnostic the caller needs. The typed
+    /// NotADirectory error pins which specific inode in the
+    /// chain wasn't a directory.
+    #[test]
+    fn test_open_path_non_directory_parent_returns_not_a_directory() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(&mut img, 6, &[(2, b".", 2), (2, b"..", 2), (11, b"foo", 1)]);
+        // Inode 11 is a regular file (no extents flag, mode 0).
+        // open_path("/foo/bar") tries to walk into it as if it
+        // were a directory → NotADirectory.
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let err = fs.open_path("/foo/bar").unwrap_err();
+        assert!(matches!(err, Ext4Error::NotADirectory { inode: 11 }));
+    }
+
+    /// `open_path` with a missing component returns NotFound
+    /// with the offending name.
+    ///
+    /// Bug it catches: a NotFound surfaced without the missing
+    /// component name forces the caller to re-walk the path
+    /// themselves to know which segment failed. Surfacing the
+    /// name lets the caller log it directly.
+    #[test]
+    fn test_open_path_missing_component_returns_not_found_with_name() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(&mut img, 6, &[(2, b".", 2), (2, b"..", 2)]);
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let err = fs.open_path("/missing").unwrap_err();
+        match err {
+            Ext4Error::NotFound { name } => assert_eq!(name, b"missing"),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    /// `open_path` tolerates double-slash and trailing slash in
+    /// path strings.
+    ///
+    /// Bug it catches: a strict parser that errors on "//"
+    /// would reject paths produced by simple string joins
+    /// (`format!("/{}/{}", parent, name)` when parent is empty)
+    /// and trailing slashes from shell-style path expansion.
+    /// Tolerating these matches the convention POSIX paths
+    /// follow.
+    #[test]
+    fn test_open_path_tolerates_double_slash_and_trailing_slash() {
+        let mut img = build_image(0o040755, 2);
+        setup_root_as_directory(&mut img, 6, 1);
+        write_dir_entries_at_block(&mut img, 6, &[(2, b".", 2), (2, b"..", 2), (11, b"foo", 1)]);
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        assert_eq!(fs.open_path("//foo").unwrap(), 11);
+        assert_eq!(fs.open_path("/foo/").unwrap(), 11);
+        assert_eq!(fs.open_path("///").unwrap(), ROOT_INODE);
     }
 
     /// An empty extent tree (entries=0 in i_block) resolves

@@ -1,7 +1,8 @@
 //! Error type for the ext4 read API.
 
 use spec::{
-    ExtentDecodeError, GroupDescriptorDecodeError, InodeDecodeError, SuperblockDecodeError,
+    DirEntryDecodeError, ExtentDecodeError, GroupDescriptorDecodeError, InodeDecodeError,
+    SuperblockDecodeError,
 };
 
 /// All failure modes the read API surfaces.
@@ -30,6 +31,22 @@ pub enum Ext4Error {
     /// Extent tree node decode failed.
     #[error("extent decode: {0}")]
     Extent(#[from] ExtentDecodeError),
+
+    /// Directory entry decode failed.
+    #[error("directory entry decode: {0}")]
+    DirEntry(#[from] DirEntryDecodeError),
+
+    /// Path resolution did not find a matching entry. Surfaces
+    /// the missing component name so callers can report which
+    /// part of the path was wrong.
+    #[error("not found: {name:?}")]
+    NotFound { name: Vec<u8> },
+
+    /// A non-final path component referenced a non-directory
+    /// inode — e.g. open_path("/etc/passwd/foo") where
+    /// `/etc/passwd` is a regular file.
+    #[error("not a directory: inode {inode}")]
+    NotADirectory { inode: u32 },
 
     /// Extent walk requested on an inode that uses the legacy
     /// ext2/3 block-pointer scheme rather than ext4 extents.
