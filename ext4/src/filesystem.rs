@@ -566,6 +566,126 @@ impl<R: Read + Seek> Filesystem<R> {
         Ok(())
     }
 
+    /// Create an empty directory at `path`. Returns the new
+    /// directory's inode number.
+    ///
+    /// Allocates a new inode + one data block for the directory
+    /// contents, writes the canonical `.` and `..` entries
+    /// (with `..` filling the rest of the block per the kernel
+    /// invariant), and adds the parent's dir entry. Bumps the
+    /// parent inode's `links_count` (a new subdirectory's `..`
+    /// adds a link to the parent) and the group's
+    /// `used_dirs_count`.
+    ///
+    /// v0 limits inherited from `create_file`: single block
+    /// group, contiguous block allocation, parent dir must have
+    /// rec_len slack. Errors with `AlreadyExists` on collision,
+    /// `NotADirectory` if the parent isn't a dir.
+    pub fn mkdir(&mut self, path: &str) -> Result<u32, Ext4Error>
+    where
+        R: Write,
+    {
+        let (parent_path, dirname) = Self::split_path(path)?;
+        let parent_inode_num = self.open_path(parent_path)?;
+        let mut parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: parent_inode_num,
+            });
+        }
+
+        match self.lookup(&parent_inode, dirname.as_bytes()) {
+            Ok(_) => {
+                return Err(Ext4Error::AlreadyExists {
+                    name: dirname.as_bytes().to_vec(),
+                });
+            }
+            Err(Ext4Error::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Allocate inode + 1 data block for the dir contents.
+        let block_size = self.superblock.block_size as u64;
+        let new_inode_num = self.allocate_inode()?;
+        let dir_block = self.allocate_blocks_contiguous(1)?;
+
+        // Build the new dir's i_block: extent header + 1 leaf
+        // extent → dir_block.
+        let mut block_bytes = [0u8; I_BLOCK_LEN];
+        let header = ExtentHeader {
+            entries: 1,
+            max: 4,
+            depth: 0,
+            generation: 0,
+        };
+        header.encode_into(&mut block_bytes[..12])?;
+        Extent {
+            logical_block: 0,
+            len: 1,
+            physical_block: dir_block,
+            uninit: false,
+        }
+        .encode_into(&mut block_bytes[12..24])?;
+
+        let new_inode = Inode {
+            mode: 0o040755,
+            uid: 0,
+            gid: 0,
+            size: block_size,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            // 2 = "." (self-link in the new dir) + parent's
+            // entry to it. Adding a subdir later will increment
+            // this further, but at creation time it's exactly 2.
+            links_count: 2,
+            blocks_lo: (block_size / 512) as u32,
+            blocks_hi: 0,
+            flags: INODE_FLAG_EXTENTS,
+            block: block_bytes,
+            generation: 0,
+            file_acl_lo: 0,
+            file_acl_hi: 0,
+        };
+        self.write_inode(new_inode_num, &new_inode)?;
+
+        // Write the dir's data block: "." and ".." entries.
+        let mut data = vec![0u8; block_size as usize];
+        let dot = DirEntry {
+            inode: new_inode_num,
+            rec_len: 12,
+            file_type_raw: 2,
+            name: b".".to_vec(),
+        };
+        let dotdot = DirEntry {
+            inode: parent_inode_num,
+            rec_len: (block_size as u16) - 12,
+            file_type_raw: 2,
+            name: b"..".to_vec(),
+        };
+        dot.encode_into(&mut data[..12])?;
+        dotdot.encode_into(&mut data[12..])?;
+        self.reader.seek(SeekFrom::Start(dir_block * block_size))?;
+        self.reader.write_all(&data)?;
+
+        // Add dir entry to parent. file_type = 2 (Directory).
+        self.add_dir_entry(&parent_inode, dirname.as_bytes(), new_inode_num, 2)?;
+
+        // Bump parent's links_count — the new subdir's ".."
+        // entry adds a link to the parent. Re-write the inode.
+        parent_inode.links_count += 1;
+        self.write_inode(parent_inode_num, &parent_inode)?;
+
+        // Bump group used_dirs_count for the Orlov allocator's
+        // benefit (we don't use it, but e2fsck validates the
+        // count against actual dir-mode inodes in pass 5).
+        self.gdt[0].used_dirs_count += 1;
+
+        self.flush_metadata()?;
+        Ok(new_inode_num)
+    }
+
     /// Create a regular file at `path` with the given contents.
     /// Returns the new file's inode number.
     ///

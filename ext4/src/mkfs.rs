@@ -616,6 +616,103 @@ mod tests {
         }
     }
 
+    /// `mkdir` creates a new subdirectory whose `read_dir`
+    /// returns the canonical `[".", ".."]` and whose `..` points
+    /// back at the parent.
+    ///
+    /// Bug it catches: any field-offset error in mkdir's inode
+    /// build (links_count, mode, extents flag, the embedded
+    /// extent header) surfaces as either an open-failure or a
+    /// read_dir that returns garbage. The bidirectional `..`
+    /// check pins parent-link correctness — a parser writing
+    /// `..` with the wrong inode number would fail the assertion.
+    #[test]
+    fn test_format_then_mkdir_creates_walkable_subdirectory() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        let sub_inode_num = fs.mkdir("/sub").unwrap();
+
+        let sub = fs.read_inode(sub_inode_num).unwrap();
+        assert!(sub.is_directory());
+        assert_eq!(sub.links_count, 2);
+
+        let entries = fs.read_dir(&sub).unwrap();
+        let names: Vec<&[u8]> = entries
+            .iter()
+            .filter(|e| !e.is_unused())
+            .map(|e| e.name.as_slice())
+            .collect();
+        assert!(names.iter().any(|n| *n == b"."));
+        assert!(names.iter().any(|n| *n == b".."));
+        let dotdot = entries.iter().find(|e| e.name == b"..").unwrap();
+        assert_eq!(dotdot.inode, ROOT_INODE, "/sub/.. should point at root");
+    }
+
+    /// `mkdir` bumps the parent inode's links_count.
+    ///
+    /// Bug it catches: forgetting to update the parent makes
+    /// e2fsck flag a "links_count wrong" inconsistency in pass
+    /// 4. The kernel still mounts and reads the FS, but a
+    /// subsequent rmdir on the new subdir would mis-account
+    /// the parent's count.
+    #[test]
+    fn test_mkdir_increments_parent_links_count() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        let root_before = fs.read_inode(ROOT_INODE).unwrap();
+        assert_eq!(root_before.links_count, 2);
+        fs.mkdir("/sub").unwrap();
+        let root_after = fs.read_inode(ROOT_INODE).unwrap();
+        assert_eq!(
+            root_after.links_count, 3,
+            "root's links_count should bump by 1 after mkdir adds a child"
+        );
+    }
+
+    /// File can be created inside a freshly-mkdir'd subdir, and
+    /// resolved via `open_path("/sub/file.txt")`.
+    ///
+    /// Bug it catches: integration test for the full nested
+    /// path. A mkdir that produces a directory whose data block
+    /// can't be walked further (extent pointing at the wrong
+    /// block, dir entries written at the wrong offset) would
+    /// fail open_path on any nested target.
+    #[test]
+    fn test_mkdir_then_create_file_inside_resolves_via_nested_path() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.mkdir("/etc").unwrap();
+        let file_inode = fs.create_file("/etc/hostname", b"justext4-test").unwrap();
+        assert_eq!(fs.open_path("/etc/hostname").unwrap(), file_inode);
+
+        let inode = fs.read_inode(file_inode).unwrap();
+        assert_eq!(fs.read_file(&inode).unwrap(), b"justext4-test");
+    }
+
+    /// `mkdir` rejects a name that already exists with
+    /// AlreadyExists, regardless of whether the existing entry
+    /// is a file or another dir.
+    #[test]
+    fn test_mkdir_collision_returns_already_exists() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.create_file("/foo", b"existing file").unwrap();
+        let err = fs.mkdir("/foo").unwrap_err();
+        assert!(matches!(err, Ext4Error::AlreadyExists { .. }));
+    }
+
     /// Volume label round-trips through format → open.
     ///
     /// Bug it catches: a label setter that writes to the wrong
