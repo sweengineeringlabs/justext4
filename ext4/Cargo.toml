@@ -1,0 +1,20 @@
+[package]
+name        = "swe_justext4_ext4"
+version     = "0.1.0"
+description = "Read API over ext4 images. Filesystem<R: Read+Seek> opens an image, walks the inode table and extent trees, and returns file contents."
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+rust-version.workspace = true
+
+[lib]
+name = "ext4"
+path = "src/lib.rs"
+
+[dependencies]
+spec      = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

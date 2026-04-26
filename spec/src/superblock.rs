@@ -25,7 +25,10 @@ const OFF_INODES_COUNT: usize = 0x00;
 const OFF_BLOCKS_COUNT_LO: usize = 0x04;
 const OFF_FREE_BLOCKS_COUNT_LO: usize = 0x0C;
 const OFF_FREE_INODES_COUNT: usize = 0x10;
+const OFF_FIRST_DATA_BLOCK: usize = 0x14;
 const OFF_LOG_BLOCK_SIZE: usize = 0x18;
+const OFF_BLOCKS_PER_GROUP: usize = 0x20;
+const OFF_INODES_PER_GROUP: usize = 0x28;
 const OFF_REV_LEVEL: usize = 0x4C;
 const OFF_INODE_SIZE: usize = 0x58;
 const OFF_MAGIC: usize = 0x38;
@@ -116,6 +119,21 @@ pub struct Superblock {
     /// [`Superblock::group_descriptor_size`] for the value the
     /// kernel actually applies.
     pub desc_size: u16,
+
+    /// `s_first_data_block` — block number of the first data
+    /// block. 0 for filesystems with block size >= 2 KiB; 1 for
+    /// 1 KiB-block images (where block 0 holds the boot sector).
+    /// The GDT lives at `first_data_block + 1`.
+    pub first_data_block: u32,
+
+    /// Number of blocks per group. Together with `blocks_count`,
+    /// determines the group count and therefore the GDT length.
+    pub blocks_per_group: u32,
+
+    /// Number of inodes per group. Used to convert an inode
+    /// number into a (group, index) pair when locating it within
+    /// the inode table.
+    pub inodes_per_group: u32,
 }
 
 impl Superblock {
@@ -193,7 +211,23 @@ impl Superblock {
             uuid,
             volume_name,
             desc_size: read_u16(buf, OFF_DESC_SIZE),
+            first_data_block: read_u32(buf, OFF_FIRST_DATA_BLOCK),
+            blocks_per_group: read_u32(buf, OFF_BLOCKS_PER_GROUP),
+            inodes_per_group: read_u32(buf, OFF_INODES_PER_GROUP),
         })
+    }
+
+    /// Number of block groups in the filesystem, derived from
+    /// `blocks_count` and `blocks_per_group`. Returns 0 if
+    /// `blocks_per_group` is zero (would otherwise be a divide-
+    /// by-zero on a corrupt superblock).
+    pub fn group_count(&self) -> u32 {
+        if self.blocks_per_group == 0 {
+            return 0;
+        }
+        let per_group = self.blocks_per_group as u64;
+        // Last group may be partial — round up.
+        self.blocks_count.div_ceil(per_group) as u32
     }
 
     /// True iff `INCOMPAT_64BIT` is set. 64-bit images use 64-byte
@@ -541,5 +575,59 @@ mod tests {
         buf[OFF_DESC_SIZE..OFF_DESC_SIZE + 2].copy_from_slice(&64u16.to_le_bytes());
         let sb = Superblock::decode(&buf).unwrap();
         assert_eq!(sb.group_descriptor_size(), 64);
+    }
+
+    /// `first_data_block`, `blocks_per_group`, `inodes_per_group`
+    /// round-trip through decode.
+    ///
+    /// Bug it catches: any field-offset slip in the layout-
+    /// arithmetic fields breaks every downstream calculation
+    /// (group count, GDT location, inode-to-group mapping). The
+    /// test pins the on-disk offsets so a future refactor can't
+    /// silently drift them.
+    #[test]
+    fn test_decode_layout_arithmetic_fields_round_trip() {
+        let mut buf = buf_with(EXT4_MAGIC, 2, 1, 0);
+        buf[OFF_FIRST_DATA_BLOCK..OFF_FIRST_DATA_BLOCK + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[OFF_BLOCKS_PER_GROUP..OFF_BLOCKS_PER_GROUP + 4]
+            .copy_from_slice(&32768u32.to_le_bytes());
+        buf[OFF_INODES_PER_GROUP..OFF_INODES_PER_GROUP + 4].copy_from_slice(&8192u32.to_le_bytes());
+        let sb = Superblock::decode(&buf).unwrap();
+        assert_eq!(sb.first_data_block, 1);
+        assert_eq!(sb.blocks_per_group, 32768);
+        assert_eq!(sb.inodes_per_group, 8192);
+    }
+
+    /// `group_count()` rounds up so a partial last group is
+    /// counted.
+    ///
+    /// Bug it catches: a parser that does floor-division would
+    /// under-count groups on any image whose total blocks isn't an
+    /// exact multiple of `blocks_per_group`, missing the final
+    /// (partial) group's GDT entry and inode table.
+    #[test]
+    fn test_group_count_rounds_up_partial_last_group() {
+        let mut buf = buf_with(EXT4_MAGIC, 2, 1, 0);
+        buf[OFF_BLOCKS_COUNT_LO..OFF_BLOCKS_COUNT_LO + 4].copy_from_slice(&33000u32.to_le_bytes());
+        buf[OFF_BLOCKS_PER_GROUP..OFF_BLOCKS_PER_GROUP + 4]
+            .copy_from_slice(&32768u32.to_le_bytes());
+        let sb = Superblock::decode(&buf).unwrap();
+        // 33000 / 32768 = 1.007 → rounds up to 2.
+        assert_eq!(sb.group_count(), 2);
+    }
+
+    /// `group_count()` returns 0 on a corrupt zero
+    /// `blocks_per_group` instead of dividing by zero.
+    ///
+    /// Bug it catches: a panic in the divide-by-zero path would
+    /// crash any caller that opens a maliciously-crafted image
+    /// with `blocks_per_group = 0`. Returning 0 lets the caller
+    /// decide.
+    #[test]
+    fn test_group_count_zero_blocks_per_group_returns_zero() {
+        let buf = buf_with(EXT4_MAGIC, 2, 1, 0);
+        // blocks_per_group already 0 from buf_with.
+        let sb = Superblock::decode(&buf).unwrap();
+        assert_eq!(sb.group_count(), 0);
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["spec"]
+members = ["spec", "ext4"]
 
 [workspace.package]
 edition      = "2021"
@@ -11,6 +11,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 spec = { path = "spec", package = "swe_justext4_spec" }
+ext4 = { path = "ext4", package = "swe_justext4_ext4" }
 
 # External — kept minimal. ext4 on-disk format is a packed binary
 # layout; the toolbox is bytes, slicing, and integer math. Pulling
