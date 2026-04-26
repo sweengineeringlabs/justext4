@@ -683,3 +683,91 @@ fn test_format_then_create_file_then_truncate_passes_e2fsck_clean() {
         "e2fsck found a problem requiring fix after truncate"
     );
 }
+
+/// `format → mkdir /a → mkdir /b → mkdir /a/x → rename /a/x → /b/x →
+/// e2fsck-clean`. Validates the cross-directory directory-move
+/// path against kernel-grade fsck.
+///
+/// Bug it catches: a rename that doesn't update the moved dir's
+/// `..` to point at its new parent fails e2fsck pass 3 ("Bad
+/// `..` in directory inode"). A rename that doesn't transfer the
+/// `links_count` between the old and new parents fails e2fsck
+/// pass 4 ("Reference count wrong") on both parent inodes. A
+/// rename that adds a dir entry with a stale or wrong
+/// `file_type_raw` byte fails pass 2 ("Wrong filetype for
+/// entry"). A rename that leaks the original entry by failing to
+/// remove it would surface as a duplicate-name complaint or as
+/// the moved directory appearing under both old and new paths.
+#[test]
+fn test_format_then_rename_across_dirs_passes_e2fsck_clean() {
+    let runner = detect_runner();
+    if matches!(runner, E2fsckRunner::Unavailable) {
+        eprintln!(
+            "SKIP: e2fsck not on PATH and JUSTEXT4_E2FSCK_VIA_WSL not set; \
+             cannot validate post-rename image state"
+        );
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "justext4-e2fsck-rename-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("image.ext4");
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&img)
+        .unwrap();
+    format(&mut file, &Config::default()).unwrap();
+    drop(file);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img)
+        .unwrap();
+    let mut fs = Filesystem::open(file).unwrap();
+    fs.mkdir("/a").unwrap();
+    fs.mkdir("/b").unwrap();
+    fs.mkdir("/a/x").unwrap();
+    fs.rename("/a/x", "/b/x").unwrap();
+    drop(fs);
+
+    let mut cmd = build_command(&runner, &img);
+    eprintln!("running: {cmd:?}");
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn e2fsck");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- e2fsck stdout ---\n{stdout}");
+    eprintln!("--- e2fsck stderr ---\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "e2fsck rejected post-rename image (exit code: {:?})",
+        output.status.code()
+    );
+    assert!(
+        !stdout.contains("WARNING"),
+        "e2fsck flagged warnings after rename; `..`, links_count, or file_type drift?"
+    );
+    assert!(
+        !stdout.contains("Fix?"),
+        "e2fsck found a problem requiring fix after rename"
+    );
+}

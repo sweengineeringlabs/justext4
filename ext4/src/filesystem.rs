@@ -1416,6 +1416,279 @@ impl<R: Read + Seek> Filesystem<R> {
         self.flush_metadata()?;
         Ok(())
     }
+
+    /// Update the `..` entry inside `dir_inode`'s first data block
+    /// to point at `new_parent_inode_num`. Used by cross-directory
+    /// directory moves so the moved subtree's parent back-reference
+    /// stays consistent with its new location.
+    ///
+    /// v0 only walks the first data block (mirrors mkdir's
+    /// single-block invariant). The `..` entry is located by name
+    /// rather than by offset so we don't bake in the "offset 12"
+    /// layout assumption — a directory whose entries have been
+    /// reshuffled by add/remove operations may have `..` somewhere
+    /// other than the second slot.
+    fn update_dotdot(
+        &mut self,
+        dir_inode: &Inode,
+        new_parent_inode_num: u32,
+    ) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let block_size = self.superblock.block_size as usize;
+        let physical =
+            self.resolve_logical_block(dir_inode, 0)?
+                .ok_or(Ext4Error::InvalidLayout {
+                    reason: "directory has no first data block",
+                })?;
+        let block_byte_offset = physical * (block_size as u64);
+        self.reader.seek(SeekFrom::Start(block_byte_offset))?;
+        let mut block_buf = vec![0u8; block_size];
+        self.reader.read_exact(&mut block_buf)?;
+
+        let mut cursor = 0usize;
+        while cursor < block_size {
+            let entry = DirEntry::decode(&block_buf[cursor..])?;
+            let rec_len = entry.rec_len as usize;
+            if !entry.is_unused() && entry.name == b".." {
+                let mut updated = entry;
+                updated.inode = new_parent_inode_num;
+                updated.encode_into(&mut block_buf[cursor..cursor + rec_len])?;
+                self.reader.seek(SeekFrom::Start(block_byte_offset))?;
+                self.reader.write_all(&block_buf)?;
+                return Ok(());
+            }
+            if rec_len == 0 {
+                // Defensive: a zero rec_len would loop forever. The
+                // spec decoder rejects this, but bound the walk too.
+                break;
+            }
+            cursor += rec_len;
+        }
+        Err(Ext4Error::InvalidLayout {
+            reason: "directory has no `..` entry",
+        })
+    }
+
+    /// Rename (and/or move) an entry from `old_path` to `new_path`.
+    ///
+    /// Mirrors POSIX `rename(2)` semantics within the v0 limits:
+    /// - Same-name same-parent rename and cross-directory moves are
+    ///   both supported.
+    /// - If `new_path` already exists and is a regular file or
+    ///   symlink, and the source is also a regular file or symlink,
+    ///   the destination is unlinked first (its inode + blocks are
+    ///   freed) and then replaced. This is the kernel's overwrite
+    ///   contract for `rename(file, file)`.
+    /// - If `new_path` is an existing directory, returns
+    ///   `AlreadyExists`. POSIX requires `EEXIST` (or `ENOTEMPTY`)
+    ///   for renaming onto a directory; v0 doesn't try to merge.
+    /// - If source and destination types disagree (file → existing
+    ///   dir, dir → existing file), returns `AlreadyExists`. The
+    ///   POSIX errors are `EISDIR` / `ENOTDIR`; we map both to the
+    ///   already-exists family because v0's caller surface only
+    ///   distinguishes "would clobber".
+    /// - Cross-directory move of a directory updates the moved
+    ///   directory's `..` entry to point at the new parent, and
+    ///   transfers the link-count contribution: old parent loses a
+    ///   `links_count`, new parent gains one. The directory's own
+    ///   `links_count` stays at 2 (`.` + parent's entry).
+    /// - Cross-directory move of a non-directory leaves both
+    ///   parents' `links_count` unchanged (regular files and
+    ///   symlinks contribute via dir entries only, not via
+    ///   back-references).
+    /// - Same-directory rename leaves the parent's `links_count`
+    ///   unchanged regardless of source type (only the dir entry's
+    ///   slot in the data block changes).
+    ///
+    /// **Atomicity caveat.** v0 is not crash-atomic. The order is:
+    /// optionally unlink existing destination, add new entry,
+    /// remove old entry, then for dir moves update `..` and the
+    /// parents' links. A crash mid-sequence leaves a partially
+    /// renamed state. A journal-based atomic rename lands when v0
+    /// grows journaling support.
+    ///
+    /// Errors:
+    /// - `NotFound` — source doesn't exist.
+    /// - `NotADirectory` — old_parent or new_parent isn't a dir.
+    /// - `AlreadyExists` — destination is a dir, or source/dest
+    ///   types mismatch.
+    /// - `InvalidLayout` — attempt to rename the root inode itself
+    ///   (e.g. resolving `/` as the source), or a directory move
+    ///   where the source's `..` entry is missing (corruption).
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let (old_parent_path, old_name) = Self::split_path(old_path)?;
+        let (new_parent_path, new_name) = Self::split_path(new_path)?;
+
+        // Resolve old parent + source.
+        let old_parent_inode_num = self.open_path(old_parent_path)?;
+        let mut old_parent_inode = self.read_inode(old_parent_inode_num)?;
+        if !old_parent_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: old_parent_inode_num,
+            });
+        }
+        let src_inode_num = self.lookup(&old_parent_inode, old_name.as_bytes())?;
+        if src_inode_num == ROOT_INODE {
+            // Defence in depth — `lookup` would have to return
+            // ROOT_INODE for `old_name = "."` inside root or for a
+            // corrupt entry pointing at inode 2. Renaming the root
+            // would orphan the entire filesystem.
+            return Err(Ext4Error::InvalidLayout {
+                reason: "cannot rename the root inode",
+            });
+        }
+        let src_inode = self.read_inode(src_inode_num)?;
+        let src_is_dir = src_inode.is_directory();
+        // Map the source inode's file type to the dir-entry
+        // file_type byte. We use the inode's mode-derived classification
+        // so the new entry agrees with the on-disk inode regardless of
+        // what byte the *old* dir entry happened to carry (defence
+        // against dir entries with file_type_raw=0 / EXT4_FT_UNKNOWN).
+        let new_file_type: u8 = if src_is_dir {
+            2 // EXT4_FT_DIR
+        } else if src_inode.is_symlink() {
+            7 // EXT4_FT_SYMLINK
+        } else if src_inode.is_regular() {
+            1 // EXT4_FT_REG_FILE
+        } else {
+            // v0 only produces regular files, dirs, and symlinks.
+            // A foreign-image entry of another type (fifo, socket,
+            // device) is rejected rather than rounded down to 0
+            // — UnsupportedV0 documents the gap.
+            return Err(Ext4Error::UnsupportedV0 {
+                detail: "rename of non-regular, non-dir, non-symlink inode",
+            });
+        };
+
+        // Resolve new parent.
+        let new_parent_inode_num = self.open_path(new_parent_path)?;
+        let mut new_parent_inode = self.read_inode(new_parent_inode_num)?;
+        if !new_parent_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: new_parent_inode_num,
+            });
+        }
+
+        // If old and new resolve to the same (parent, name) pair the
+        // source IS the destination — no-op success per POSIX. We
+        // detect this via the inode-number identity rather than the
+        // path text so callers passing equivalent-but-different-text
+        // paths (e.g. trailing slashes) still hit the no-op.
+        let same_parent = old_parent_inode_num == new_parent_inode_num;
+
+        // Look up destination. A miss here is the common case
+        // (rename to a fresh name).
+        let dst_lookup = self.lookup(&new_parent_inode, new_name.as_bytes());
+        match dst_lookup {
+            Ok(dst_inode_num) => {
+                if dst_inode_num == src_inode_num {
+                    // Renaming a name onto itself is a no-op. POSIX
+                    // requires success.
+                    return Ok(());
+                }
+                let dst_inode = self.read_inode(dst_inode_num)?;
+                if dst_inode.is_directory() {
+                    // POSIX EEXIST / ENOTEMPTY for rename(x, dir).
+                    return Err(Ext4Error::AlreadyExists {
+                        name: new_name.as_bytes().to_vec(),
+                    });
+                }
+                if src_is_dir {
+                    // Source is a directory but destination is a
+                    // file/symlink → POSIX ENOTDIR. Surface as
+                    // AlreadyExists since v0's caller surface only
+                    // distinguishes "would clobber".
+                    return Err(Ext4Error::AlreadyExists {
+                        name: new_name.as_bytes().to_vec(),
+                    });
+                }
+                // Both source and destination are regular file /
+                // symlink. POSIX rename overwrites — unlink the
+                // destination first.
+                let dst_full_path = join_path(new_parent_path, new_name);
+                self.unlink(&dst_full_path)?;
+                // Re-read the new parent inode. unlink mutated the
+                // parent's data block (entry removal) but not the
+                // inode itself, so the cached struct is technically
+                // still valid; re-reading is defensive against a
+                // future change to unlink that DOES touch the inode.
+                new_parent_inode = self.read_inode(new_parent_inode_num)?;
+                // Same-parent rename: old_parent_inode aliases the
+                // same on-disk inode we just re-read, so refresh it
+                // too to avoid two stale-vs-fresh views diverging.
+                if same_parent {
+                    old_parent_inode = new_parent_inode.clone();
+                }
+            }
+            Err(Ext4Error::NotFound { .. }) => {
+                // Destination is free — common path.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Add the new dir entry pointing at the source inode. The
+        // file_type byte is computed from the inode itself, not
+        // copied from the old dir entry.
+        self.add_dir_entry(
+            &new_parent_inode,
+            new_name.as_bytes(),
+            src_inode_num,
+            new_file_type,
+        )?;
+        // If old and new parents are the same on-disk directory,
+        // add_dir_entry just modified the same data block we're
+        // about to walk in remove_dir_entry. We need to use the
+        // freshest in-memory view of the parent inode for both
+        // calls; the inode-struct fields don't change, so re-using
+        // old_parent_inode is fine — but in the same-parent case,
+        // the re-fetch above already aligned the two.
+        let old_parent_for_remove = if same_parent {
+            &new_parent_inode
+        } else {
+            &old_parent_inode
+        };
+        self.remove_dir_entry(old_parent_for_remove, src_inode_num, old_name.as_bytes())?;
+
+        // Cross-directory move of a directory: fix up the link
+        // bookkeeping. Non-dir cross-dir moves leave both parents'
+        // `links_count` untouched (regular files and symlinks
+        // contribute via dir entries only, not via back-references).
+        if !same_parent && src_is_dir {
+            // The moved directory's `..` entry must follow it.
+            self.update_dotdot(&src_inode, new_parent_inode_num)?;
+            // Transfer the link-count contribution between
+            // parents. The moved directory's own links_count
+            // stays at 2 (`.` self-link + parent's entry).
+            if old_parent_inode.links_count > 0 {
+                old_parent_inode.links_count -= 1;
+            }
+            new_parent_inode.links_count += 1;
+            self.write_inode(old_parent_inode_num, &old_parent_inode)?;
+            self.write_inode(new_parent_inode_num, &new_parent_inode)?;
+        }
+
+        // Persist any superblock / GDT changes that the called
+        // helpers (unlink path) may have left dirty.
+        self.flush_metadata()?;
+        Ok(())
+    }
+}
+/// Join `parent_path` and `name` into a single absolute path, used
+/// by `rename`'s overwrite path to reconstruct a full path for
+/// `unlink`. `split_path` plus `open_path` together tolerate
+/// double-slashes (`"//foo"`), so we don't need to special-case
+/// `parent_path == "/"` — but we do anyway for cleanliness.
+fn join_path(parent_path: &str, name: &str) -> String {
+    if parent_path == "/" {
+        format!("/{name}")
+    } else {
+        format!("{parent_path}/{name}")
+    }
 }
 
 /// 4-byte alignment helper used by directory-entry placement.
