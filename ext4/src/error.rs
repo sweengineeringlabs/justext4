@@ -1,6 +1,8 @@
 //! Error type for the ext4 read API.
 
-use spec::{GroupDescriptorDecodeError, InodeDecodeError, SuperblockDecodeError};
+use spec::{
+    ExtentDecodeError, GroupDescriptorDecodeError, InodeDecodeError, SuperblockDecodeError,
+};
 
 /// All failure modes the read API surfaces.
 ///
@@ -24,6 +26,23 @@ pub enum Ext4Error {
     /// Inode decode failed.
     #[error("inode decode: {0}")]
     Inode(#[from] InodeDecodeError),
+
+    /// Extent tree node decode failed.
+    #[error("extent decode: {0}")]
+    Extent(#[from] ExtentDecodeError),
+
+    /// Extent walk requested on an inode that uses the legacy
+    /// ext2/3 block-pointer scheme rather than ext4 extents.
+    /// v0 only walks extent-based inodes; legacy support lands
+    /// when a real consumer needs it.
+    #[error("inode does not use extents (legacy block-pointer layout not supported)")]
+    NotExtentBased,
+
+    /// Extent tree depth exceeded the kernel's maximum (5). Either
+    /// the image is corrupt or it was produced by a non-conforming
+    /// builder.
+    #[error("extent tree depth exceeded the maximum of {max}")]
+    MaxExtentDepthExceeded { max: u16 },
 
     /// Inode number is outside the valid range. Inode 0 is never
     /// valid (the kernel reserves it as the "no inode" sentinel);

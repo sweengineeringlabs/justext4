@@ -2,9 +2,18 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use spec::{GroupDescriptor, Inode, Superblock, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE};
+use spec::{
+    decode_extent_node, ExtentNode, GroupDescriptor, Inode, Superblock, SUPERBLOCK_OFFSET,
+    SUPERBLOCK_SIZE,
+};
 
 use crate::error::Ext4Error;
+
+/// Maximum depth of an ext4 extent tree. The kernel hard-caps tree
+/// height; anything deeper is corruption. Bounding the iterative
+/// walk by this value guarantees `resolve_logical_block` always
+/// terminates regardless of input.
+pub const MAX_EXTENT_DEPTH: u16 = 5;
 
 /// Open ext4 image. Holds the reader plus the eagerly-loaded
 /// superblock and group descriptor table. Subsequent inode reads
@@ -114,6 +123,91 @@ impl<R: Read + Seek> Filesystem<R> {
         self.reader.read_exact(&mut buf)?;
         Ok(Inode::decode(&buf, &self.superblock)?)
     }
+
+    /// Resolve an inode's logical block to its physical block on
+    /// disk by walking the extent tree.
+    ///
+    /// Returns:
+    /// - `Ok(Some(physical))` — the logical block is mapped.
+    /// - `Ok(None)` — sparse hole (no extent covers this logical
+    ///   block) or uninitialised extent (preallocated but not yet
+    ///   written; reads as zeros). Higher-level read paths
+    ///   zero-fill when they see `None`.
+    /// - `Err(NotExtentBased)` — the inode uses the legacy ext2/3
+    ///   block-pointer layout, not yet supported.
+    /// - `Err(MaxExtentDepthExceeded)` — corrupt image with a
+    ///   tree deeper than the kernel's cap of 5 levels.
+    ///
+    /// Iterative, not recursive. The loop reads at most
+    /// `MAX_EXTENT_DEPTH` blocks from disk during descent.
+    pub fn resolve_logical_block(
+        &mut self,
+        inode: &Inode,
+        logical: u32,
+    ) -> Result<Option<u64>, Ext4Error> {
+        if !inode.uses_extents() {
+            return Err(Ext4Error::NotExtentBased);
+        }
+
+        let block_size = self.superblock.block_size as u64;
+        let mut node_buf: Vec<u8> = inode.block.to_vec();
+        let mut steps = MAX_EXTENT_DEPTH + 1;
+
+        loop {
+            if steps == 0 {
+                return Err(Ext4Error::MaxExtentDepthExceeded {
+                    max: MAX_EXTENT_DEPTH,
+                });
+            }
+            steps -= 1;
+
+            let node = decode_extent_node(&node_buf)?;
+            match node {
+                ExtentNode::Leaf { extents, .. } => {
+                    for ext in &extents {
+                        let start = ext.logical_block;
+                        let end = start as u64 + ext.len as u64;
+                        if (logical as u64) >= start as u64 && (logical as u64) < end {
+                            if ext.uninit {
+                                // Uninit extents read as zeros — surfaced as
+                                // None so the caller treats them like a hole.
+                                return Ok(None);
+                            }
+                            let offset = (logical - start) as u64;
+                            return Ok(Some(ext.physical_block + offset));
+                        }
+                    }
+                    // Logical block falls in a sparse hole between
+                    // extents (or past the last extent).
+                    return Ok(None);
+                }
+                ExtentNode::Internal { indices, .. } => {
+                    // Pick the rightmost index whose logical_block
+                    // is <= the target. Indices are stored sorted
+                    // by logical_block per the kernel's invariant.
+                    let mut chosen: Option<&spec::ExtentIndex> = None;
+                    for idx in &indices {
+                        if idx.logical_block <= logical {
+                            chosen = Some(idx);
+                        } else {
+                            break;
+                        }
+                    }
+                    let idx = match chosen {
+                        Some(i) => i,
+                        // Target is below the first index's start —
+                        // sparse hole at the front of the file.
+                        None => return Ok(None),
+                    };
+
+                    let leaf_offset = idx.leaf_block * block_size;
+                    self.reader.seek(SeekFrom::Start(leaf_offset))?;
+                    node_buf = vec![0u8; block_size as usize];
+                    self.reader.read_exact(&mut node_buf)?;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +234,9 @@ mod tests {
     // wire format directly.
 
     const BLOCK_SIZE: usize = 4096;
-    const NUM_BLOCKS: u32 = 8;
+    // Bumped from 8 to 16 (64 KiB total) to leave room for extent
+    // tree leaf blocks during depth>0 walk tests.
+    const NUM_BLOCKS: u32 = 16;
     const INODES_PER_GROUP: u32 = 32;
     const INODE_SIZE: u16 = 256;
 
@@ -162,7 +258,14 @@ mod tests {
 
     // Inode field offsets (within the 256-byte rev-1 inode).
     const I_MODE: usize = 0x00;
+    const I_SIZE_LO: usize = 0x04;
     const I_LINKS_COUNT: usize = 0x1A;
+    const I_FLAGS: usize = 0x20;
+    const I_BLOCK: usize = 0x28;
+
+    // Extent tree on-disk constants (mirror spec::extent).
+    const EXTENT_MAGIC: u16 = 0xF30A;
+    const EXTENT_FLAG: u32 = 0x0008_0000; // INODE_FLAG_EXTENTS
 
     fn write_u16(buf: &mut [u8], offset: usize, value: u16) {
         buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -170,6 +273,69 @@ mod tests {
 
     fn write_u32(buf: &mut [u8], offset: usize, value: u32) {
         buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Byte offset of inode N within the test image (computed
+    /// from the layout build_image() produces).
+    fn inode_byte_offset(inode_number: u32) -> usize {
+        // Inode table starts at block 4. Inode N lives at index
+        // (N - 1) within that table.
+        4 * BLOCK_SIZE + (inode_number as usize - 1) * INODE_SIZE as usize
+    }
+
+    /// Write a 12-byte extent header at `byte_offset`.
+    fn write_extent_header(buf: &mut [u8], byte_offset: usize, entries: u16, max: u16, depth: u16) {
+        write_u16(buf, byte_offset, EXTENT_MAGIC);
+        write_u16(buf, byte_offset + 2, entries);
+        write_u16(buf, byte_offset + 4, max);
+        write_u16(buf, byte_offset + 6, depth);
+        write_u32(buf, byte_offset + 8, 0); // generation
+    }
+
+    /// Write a 12-byte leaf extent entry at `byte_offset`.
+    /// `len_raw` is encoded directly (caller may add 32768 to
+    /// signal uninit per the kernel's convention).
+    fn write_extent_leaf(
+        buf: &mut [u8],
+        byte_offset: usize,
+        logical: u32,
+        len_raw: u16,
+        physical: u64,
+    ) {
+        write_u32(buf, byte_offset, logical);
+        write_u16(buf, byte_offset + 4, len_raw);
+        write_u16(buf, byte_offset + 6, ((physical >> 32) & 0xFFFF) as u16);
+        write_u32(buf, byte_offset + 8, (physical & 0xFFFF_FFFF) as u32);
+    }
+
+    /// Write a 12-byte extent index entry at `byte_offset`.
+    fn write_extent_index(buf: &mut [u8], byte_offset: usize, logical: u32, leaf_block: u64) {
+        write_u32(buf, byte_offset, logical);
+        write_u32(buf, byte_offset + 4, (leaf_block & 0xFFFF_FFFF) as u32);
+        write_u16(buf, byte_offset + 8, ((leaf_block >> 32) & 0xFFFF) as u16);
+        write_u16(buf, byte_offset + 10, 0); // ei_unused
+    }
+
+    /// Stamp inode N as an extents-based regular file with one
+    /// leaf extent in i_block. Returns nothing; caller can read
+    /// the inode via Filesystem::read_inode after building.
+    ///
+    /// Pass `len_raw = len + 32768` to test the uninit path.
+    fn write_inode_with_one_extent(
+        buf: &mut [u8],
+        inode_number: u32,
+        size: u32,
+        logical: u32,
+        len_raw: u16,
+        physical: u64,
+    ) {
+        let inode_off = inode_byte_offset(inode_number);
+        write_u16(buf, inode_off + I_MODE, 0o100644); // S_IFREG | 0o644
+        write_u32(buf, inode_off + I_SIZE_LO, size);
+        write_u16(buf, inode_off + I_LINKS_COUNT, 1);
+        write_u32(buf, inode_off + I_FLAGS, EXTENT_FLAG);
+        write_extent_header(buf, inode_off + I_BLOCK, 1, 4, 0);
+        write_extent_leaf(buf, inode_off + I_BLOCK + 12, logical, len_raw, physical);
     }
 
     /// Construct a minimal valid ext4 image with the root inode
@@ -215,8 +381,8 @@ mod tests {
         let img = build_image(0o040755, 2);
         let fs = Filesystem::open(Cursor::new(img)).unwrap();
         assert_eq!(fs.superblock().block_size, 4096);
-        assert_eq!(fs.superblock().inodes_per_group, 32);
-        assert_eq!(fs.superblock().blocks_per_group, 8);
+        assert_eq!(fs.superblock().inodes_per_group, INODES_PER_GROUP);
+        assert_eq!(fs.superblock().blocks_per_group, NUM_BLOCKS);
         assert_eq!(fs.group_descriptor_table().len(), 1);
         assert_eq!(fs.group_descriptor_table()[0].inode_table, 4);
     }
@@ -307,5 +473,157 @@ mod tests {
         assert_eq!(inode.file_type(), InodeFileType::Directory);
         assert_eq!(inode.links_count, 2);
         assert!(inode.is_directory());
+    }
+
+    /// `resolve_logical_block` rejects inodes that don't have the
+    /// EXTENTS flag with a typed error.
+    ///
+    /// Bug it catches: silently treating a legacy block-pointer
+    /// inode as if its `i_block` were an extent header would
+    /// either fail with a confusing "bad magic" message (the first
+    /// 2 bytes of `i_block` are u32 block pointer, not 0xF30A) or,
+    /// worse, decode the pointer as a valid header by chance and
+    /// produce nonsense mappings. The typed error tells the
+    /// caller which surface they actually need.
+    #[test]
+    fn test_resolve_legacy_block_pointer_inode_returns_not_extent_based() {
+        let img = build_image(0o040755, 2);
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        // Root inode (inode 2) was built without the EXTENTS flag.
+        let inode = fs.read_inode(2).unwrap();
+        let err = fs.resolve_logical_block(&inode, 0).unwrap_err();
+        assert!(matches!(err, Ext4Error::NotExtentBased));
+    }
+
+    /// Single leaf extent: logical 0..8 maps to physical 100..108.
+    /// resolve(3) returns Some(103); resolve(8) returns None
+    /// (sparse hole past the end of the only extent).
+    ///
+    /// Bug it catches: a walker that returns ext.physical_block
+    /// without adding `(logical - ext.logical_block)` would always
+    /// return the start of the extent, sending every read of the
+    /// file's interior blocks to its first physical block. File
+    /// content would look like the same 4 KiB chunk repeated.
+    #[test]
+    fn test_resolve_single_leaf_extent_offsets_correctly() {
+        let mut img = build_image(0o040755, 2);
+        // Inode 11: extent-based file; logical 0..8 → physical 100..108.
+        write_inode_with_one_extent(&mut img, 11, 32_768, 0, 8, 100);
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let inode = fs.read_inode(11).unwrap();
+
+        assert_eq!(fs.resolve_logical_block(&inode, 0).unwrap(), Some(100));
+        assert_eq!(fs.resolve_logical_block(&inode, 3).unwrap(), Some(103));
+        assert_eq!(fs.resolve_logical_block(&inode, 7).unwrap(), Some(107));
+        assert_eq!(fs.resolve_logical_block(&inode, 8).unwrap(), None);
+    }
+
+    /// Uninit extent (raw len > 32768) resolves to None — the
+    /// caller treats it as a sparse hole and zero-fills.
+    ///
+    /// Bug it catches: a walker that returns the physical address
+    /// of an uninit extent would have higher layers read whatever
+    /// stale bytes happen to live in those preallocated blocks,
+    /// leaking data from a previous file (or, on disks that
+    /// haven't been zeroed, arbitrary content from prior owners)
+    /// into the current file's reads.
+    #[test]
+    fn test_resolve_uninit_extent_returns_none() {
+        let mut img = build_image(0o040755, 2);
+        // raw_len = 32768 + 4 → uninit, real run length 4.
+        write_inode_with_one_extent(&mut img, 11, 16_384, 0, 32768 + 4, 100);
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let inode = fs.read_inode(11).unwrap();
+        // Within the run; uninit means None.
+        assert_eq!(fs.resolve_logical_block(&inode, 0).unwrap(), None);
+        assert_eq!(fs.resolve_logical_block(&inode, 3).unwrap(), None);
+    }
+
+    /// Sparse hole between extents resolves to None.
+    ///
+    /// Bug it catches: a walker that returns the *next* extent's
+    /// physical address for a hole between extents would conflate
+    /// holes with the start of the following data. Reading a
+    /// sparse file would shift content forward by the size of
+    /// every preceding hole.
+    #[test]
+    fn test_resolve_sparse_hole_between_extents_returns_none() {
+        let mut img = build_image(0o040755, 2);
+        // Build manually: two extents in i_block — logical 0..4 →
+        // physical 100, then logical 100..104 → physical 200.
+        // Logical 50 is in the hole.
+        let inode_off = inode_byte_offset(11);
+        write_u16(&mut img, inode_off + I_MODE, 0o100644);
+        write_u32(&mut img, inode_off + I_SIZE_LO, 4096 * 104);
+        write_u16(&mut img, inode_off + I_LINKS_COUNT, 1);
+        write_u32(&mut img, inode_off + I_FLAGS, EXTENT_FLAG);
+        write_extent_header(&mut img, inode_off + I_BLOCK, 2, 4, 0);
+        write_extent_leaf(&mut img, inode_off + I_BLOCK + 12, 0, 4, 100);
+        write_extent_leaf(&mut img, inode_off + I_BLOCK + 24, 100, 4, 200);
+
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let inode = fs.read_inode(11).unwrap();
+        assert_eq!(fs.resolve_logical_block(&inode, 0).unwrap(), Some(100));
+        assert_eq!(fs.resolve_logical_block(&inode, 50).unwrap(), None); // hole
+        assert_eq!(fs.resolve_logical_block(&inode, 100).unwrap(), Some(200));
+    }
+
+    /// Depth=1 internal node descends to a leaf block on disk and
+    /// resolves correctly.
+    ///
+    /// Bug it catches: any error in the iterative descent — wrong
+    /// index choice, wrong leaf-block address arithmetic, failure
+    /// to re-decode the leaf block as a fresh node — would break
+    /// every file with more than 4 extents (the inode-embedded
+    /// header maxes at 4; anything bigger needs depth>0). The
+    /// test pins the descent end-to-end.
+    #[test]
+    fn test_resolve_depth_1_descends_to_leaf_block() {
+        let mut img = build_image(0o040755, 2);
+        let inode_off = inode_byte_offset(11);
+
+        // Inode 11: i_block = depth=1 internal node. One index
+        // entry at logical 0 pointing to leaf at block 8.
+        write_u16(&mut img, inode_off + I_MODE, 0o100644);
+        write_u32(&mut img, inode_off + I_SIZE_LO, 4096);
+        write_u16(&mut img, inode_off + I_LINKS_COUNT, 1);
+        write_u32(&mut img, inode_off + I_FLAGS, EXTENT_FLAG);
+        write_extent_header(&mut img, inode_off + I_BLOCK, 1, 4, 1);
+        write_extent_index(&mut img, inode_off + I_BLOCK + 12, 0, 8);
+
+        // Leaf node at block 8: depth=0 header + one extent
+        // covering logical 0..1 → physical 200.
+        let leaf_off = 8 * BLOCK_SIZE;
+        write_extent_header(&mut img, leaf_off, 1, 340, 0);
+        write_extent_leaf(&mut img, leaf_off + 12, 0, 1, 200);
+
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let inode = fs.read_inode(11).unwrap();
+        assert_eq!(fs.resolve_logical_block(&inode, 0).unwrap(), Some(200));
+    }
+
+    /// An empty extent tree (entries=0 in i_block) resolves
+    /// every logical block to None.
+    ///
+    /// Bug it catches: a walker that reads past the end of a
+    /// zero-entry extent body would either OOB-read i_block or
+    /// invent a garbage extent from the next 12 zero bytes
+    /// (logical=0, len=0, physical=0). With len=0, every logical
+    /// block falsely "matches" the extent's [0, 0) range — luckily
+    /// `<` makes this empty, but a parser using `<=` would map
+    /// every read to physical block 0 (the partition's MBR-
+    /// equivalent).
+    #[test]
+    fn test_resolve_empty_extent_tree_returns_none_for_any_logical() {
+        let mut img = build_image(0o040755, 2);
+        let inode_off = inode_byte_offset(11);
+        write_u16(&mut img, inode_off + I_MODE, 0o100644);
+        write_u32(&mut img, inode_off + I_FLAGS, EXTENT_FLAG);
+        write_extent_header(&mut img, inode_off + I_BLOCK, 0, 4, 0);
+
+        let mut fs = Filesystem::open(Cursor::new(img)).unwrap();
+        let inode = fs.read_inode(11).unwrap();
+        assert_eq!(fs.resolve_logical_block(&inode, 0).unwrap(), None);
+        assert_eq!(fs.resolve_logical_block(&inode, 999).unwrap(), None);
     }
 }
