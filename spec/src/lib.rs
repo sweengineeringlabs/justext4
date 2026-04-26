@@ -10,11 +10,16 @@
 //! the kernel source is straightforward.
 
 pub mod group_descriptor;
+pub mod inode;
 pub mod superblock;
 
 pub use group_descriptor::{
     GroupDescriptor, GroupDescriptorDecodeError, BG_FLAG_BLOCK_UNINIT, BG_FLAG_INODE_UNINIT,
     BG_FLAG_INODE_ZEROED,
+};
+pub use inode::{
+    Inode, InodeDecodeError, InodeFileType, INODE_FLAG_EXTENTS, INODE_FLAG_HUGE_FILE,
+    INODE_FLAG_INLINE_DATA, I_BLOCK_LEN, MIN_INODE_SIZE,
 };
 pub use superblock::{
     Superblock, SuperblockDecodeError, EXT4_MAGIC, FEATURE_INCOMPAT_64BIT, GDT_ENTRY_SIZE_32,
