@@ -6,3 +6,9 @@ Cargo.lock.bak
 # spec/tests/fixtures/ as small pre-built images; the .img files
 # bigger than a few KiB are regenerated and not stored).
 *.img.local
+
+# cargo-fuzz outputs (sub-project at fuzz/). Build dir, generated
+# corpora, and crash artifacts are local-only — none are committed.
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

@@ -1,0 +1,57 @@
+# Empty [workspace] table — declares this directory as its own
+# workspace root, kept distinct from the parent workspace at ../.
+# cargo-fuzz convention; mirrors what `cargo fuzz init` emits.
+[workspace]
+
+[package]
+name        = "swe_justext4-fuzz"
+version     = "0.0.0"
+publish     = false
+edition     = "2021"
+description = "cargo-fuzz harness for swe_justext4_spec decoders. Each binary feeds &[u8] into one decode entry point and asserts no panic."
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys      = "0.4"
+swe_justext4_spec  = { path = "../spec" }
+
+# Each target is a separate cargo bin. `test = false`, `doc = false`,
+# `bench = false` mirrors what `cargo fuzz init` emits — the bins are
+# driven by libFuzzer, not cargo's normal test harness.
+
+[[bin]]
+name             = "superblock_decode"
+path             = "fuzz_targets/superblock_decode.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "inode_decode"
+path             = "fuzz_targets/inode_decode.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "dir_block_decode"
+path             = "fuzz_targets/dir_block_decode.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "extent_node_decode"
+path             = "fuzz_targets/extent_node_decode.rs"
+test             = false
+doc              = false
+bench            = false
+
+[[bin]]
+name             = "group_descriptor_decode"
+path             = "fuzz_targets/group_descriptor_decode.rs"
+test             = false
+doc              = false
+bench            = false
