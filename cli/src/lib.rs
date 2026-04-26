@@ -47,6 +47,10 @@ pub fn print_usage<W: Write>(out: &mut W) -> std::io::Result<()> {
     writeln!(out, "  mkext4-rs inspect <path>")?;
     writeln!(out, "  mkext4-rs touch <image> <vfs-path> <content>")?;
     writeln!(out, "  mkext4-rs cat <image> <vfs-path>")?;
+    writeln!(
+        out,
+        "  mkext4-rs build-from-tree <host-dir> <image> [--size-blocks N] [--inodes N] [--label TEXT]"
+    )?;
     Ok(())
 }
 
@@ -206,6 +210,138 @@ pub fn cmd_touch<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError>
     Ok(())
 }
 
+/// Walk a host directory tree and replicate it inside the
+/// image. Subdirectories become ext4 dirs (`mkdir`); regular
+/// files become ext4 regular files with their content copied
+/// (`create_file`); other file types (symlinks, devices, sockets,
+/// fifos) are skipped with a warning.
+///
+/// Walks breadth-first via a stack so deeply nested trees don't
+/// blow the host stack — recursive `read_dir` would hit Rust's
+/// default 8 MB limit on a deep `node_modules`-shaped tree.
+pub fn populate_from_host_tree<R: std::io::Read + Write + std::io::Seek>(
+    fs: &mut ext4::Filesystem<R>,
+    host_root: &Path,
+) -> Result<(), CliError> {
+    let host_root = host_root
+        .canonicalize()
+        .map_err(|e| CliError(format!("canonicalize {host_root:?}: {e}")))?;
+    let metadata =
+        std::fs::metadata(&host_root).map_err(|e| CliError(format!("stat {host_root:?}: {e}")))?;
+    if !metadata.is_dir() {
+        return Err(CliError(format!("{host_root:?} is not a directory")));
+    }
+
+    // Stack of (host path, vfs path-in-image) pairs to process.
+    let mut stack: Vec<(std::path::PathBuf, String)> = vec![(host_root.clone(), String::new())];
+
+    while let Some((host_dir, vfs_dir)) = stack.pop() {
+        let read_dir = std::fs::read_dir(&host_dir)
+            .map_err(|e| CliError(format!("read_dir {host_dir:?}: {e}")))?;
+        for entry in read_dir {
+            let entry = entry.map_err(|e| CliError(format!("dir entry in {host_dir:?}: {e}")))?;
+            let name = entry.file_name();
+            let name_str = match name.to_str() {
+                Some(s) => s,
+                None => {
+                    eprintln!("warning: skipping non-UTF-8 name in {host_dir:?}");
+                    continue;
+                }
+            };
+            let vfs_child = format!("{vfs_dir}/{name_str}");
+            let file_type = entry
+                .file_type()
+                .map_err(|e| CliError(format!("file_type {name:?}: {e}")))?;
+            if file_type.is_dir() {
+                fs.mkdir(&vfs_child)
+                    .map_err(|e| CliError(format!("mkdir {vfs_child}: {e}")))?;
+                stack.push((entry.path(), vfs_child));
+            } else if file_type.is_file() {
+                let bytes = std::fs::read(entry.path())
+                    .map_err(|e| CliError(format!("read {:?}: {e}", entry.path())))?;
+                fs.create_file(&vfs_child, &bytes)
+                    .map_err(|e| CliError(format!("create_file {vfs_child}: {e}")))?;
+            } else {
+                eprintln!(
+                    "warning: skipping {vfs_child}: file type {file_type:?} not supported in v0"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Format a fresh ext4 image and populate it from a host
+/// directory tree. The single user-facing gesture for "turn this
+/// dir into a kernel-mountable rootfs."
+pub fn cmd_build_from_tree<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
+    if args.len() < 2 {
+        return Err(CliError(
+            "build-from-tree requires <host-dir> <image> [--size-blocks N] [--inodes N] [--label TEXT]"
+                .to_string(),
+        ));
+    }
+    let host_dir = std::path::PathBuf::from(&args[0]);
+    let image_path = &args[1];
+    let mut config = Config::default();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--size-blocks" => {
+                config.size_blocks = args
+                    .get(i + 1)
+                    .ok_or_else(|| CliError("--size-blocks requires a value".to_string()))?
+                    .parse::<u32>()
+                    .map_err(|e| CliError(format!("--size-blocks parse: {e}")))?;
+                i += 2;
+            }
+            "--inodes" => {
+                config.inodes_per_group = args
+                    .get(i + 1)
+                    .ok_or_else(|| CliError("--inodes requires a value".to_string()))?
+                    .parse::<u32>()
+                    .map_err(|e| CliError(format!("--inodes parse: {e}")))?;
+                i += 2;
+            }
+            "--label" => {
+                config.volume_label = args
+                    .get(i + 1)
+                    .ok_or_else(|| CliError("--label requires a value".to_string()))?
+                    .as_bytes()
+                    .to_vec();
+                i += 2;
+            }
+            other => return Err(CliError(format!("unknown flag: {other}"))),
+        }
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(Path::new(image_path))
+        .map_err(|e| CliError(format!("open {image_path}: {e}")))?;
+    fs_format(&mut file, &config).map_err(|e| CliError(format!("format: {e}")))?;
+    drop(file);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new(image_path))
+        .map_err(|e| CliError(format!("re-open {image_path}: {e}")))?;
+    let mut fs = ext4::Filesystem::open(file).map_err(|e| CliError(format!("open: {e}")))?;
+    populate_from_host_tree(&mut fs, &host_dir)?;
+
+    writeln!(
+        out,
+        "built {image_path} from {host_dir:?}: {} blocks of {} bytes, {} inode slots",
+        config.size_blocks, config.block_size, config.inodes_per_group,
+    )
+    .map_err(|e| CliError(format!("write: {e}")))?;
+    Ok(())
+}
+
 /// Read the contents of a file inside the image and write them
 /// verbatim to the writer.
 pub fn cmd_cat<W: Write>(args: &[String], out: &mut W) -> Result<(), CliError> {
@@ -348,6 +484,55 @@ mod tests {
         let mut sink = Vec::new();
         let err = cmd_format(&[], &mut sink).unwrap_err();
         assert!(err.0.contains("requires a host path"));
+    }
+
+    /// `build-from-tree` walks a small host tree and produces
+    /// an image whose contents read back through our reader.
+    ///
+    /// Bug it catches: any path/name encoding glitch, mkdir/
+    /// create_file ordering bug, or stack-vs-recursion mistake
+    /// in the walker. The test fixture spans two directory
+    /// levels with regular files at each level — exercises the
+    /// full walker path, not just one call.
+    #[test]
+    fn test_cli_build_from_tree_replicates_host_tree() {
+        let dir = Tempdir::new("build-tree");
+        let img = dir.join("image.ext4");
+        let img_str = img.to_string_lossy().into_owned();
+
+        // Build the host fixture: /etc/hostname + /etc/conf.d/network
+        let host = dir.join("rootfs");
+        std::fs::create_dir_all(host.join("etc/conf.d")).unwrap();
+        std::fs::write(host.join("etc/hostname"), b"my-host").unwrap();
+        std::fs::write(host.join("etc/conf.d/network"), b"nic0=up").unwrap();
+        std::fs::write(host.join("readme"), b"top-level file").unwrap();
+        let host_str = host.to_string_lossy().into_owned();
+
+        let mut sink = Vec::new();
+        cmd_build_from_tree(
+            &[
+                host_str,
+                img_str.clone(),
+                "--inodes".into(),
+                "64".into(),
+                "--size-blocks".into(),
+                "256".into(),
+            ],
+            &mut sink,
+        )
+        .unwrap();
+
+        // Now read the image back and verify content.
+        let mut fs = ext4::Filesystem::open(std::fs::File::open(&img).unwrap()).unwrap();
+        let n = fs.open_path("/etc/hostname").unwrap();
+        let inode = fs.read_inode(n).unwrap();
+        assert_eq!(fs.read_file(&inode).unwrap(), b"my-host");
+        let n = fs.open_path("/etc/conf.d/network").unwrap();
+        let inode = fs.read_inode(n).unwrap();
+        assert_eq!(fs.read_file(&inode).unwrap(), b"nic0=up");
+        let n = fs.open_path("/readme").unwrap();
+        let inode = fs.read_inode(n).unwrap();
+        assert_eq!(fs.read_file(&inode).unwrap(), b"top-level file");
     }
 
     /// Unknown flag surfaces a typed CliError.

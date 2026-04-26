@@ -66,6 +66,15 @@ pub struct Config {
     /// Total number of blocks in the image.
     pub size_blocks: u32,
 
+    /// Total inodes in the filesystem. Caps how many distinct
+    /// files + directories the image can hold (every entry needs
+    /// its own inode). The default 32 is enough for the toy
+    /// tests; for a real rootfs you want hundreds. The kernel
+    /// rule is `inodes_count <= inodes_per_group * group_count`,
+    /// and v0 uses a single group, so this also caps the
+    /// inode-bitmap range.
+    pub inodes_per_group: u32,
+
     /// Volume label, truncated/padded to 16 bytes by [`format`].
     /// Empty bytes (no label) are fine.
     pub volume_label: Vec<u8>,
@@ -76,14 +85,11 @@ impl Default for Config {
         Config {
             block_size: 4096,
             size_blocks: 16,
+            inodes_per_group: 32,
             volume_label: b"justext4".to_vec(),
         }
     }
 }
-
-/// Inodes per group. Hard-coded for v0 — single-group images
-/// don't need many inodes.
-const INODES_PER_GROUP: u32 = 32;
 
 /// Inode size on disk. Modern ext4 uses 256 bytes; rev-0 used
 /// 128. We pick 256 to match `mkfs.ext4` defaults.
@@ -112,8 +118,13 @@ impl Layout {
                 reason: "block_size must be 1024, 2048, 4096, or 65536",
             });
         }
+        if config.inodes_per_group < 11 {
+            return Err(Ext4Error::InvalidLayout {
+                reason: "inodes_per_group must be at least 11 (10 reserved + root)",
+            });
+        }
         let block_size = config.block_size as u64;
-        let inode_table_bytes = (INODES_PER_GROUP as u64) * (INODE_SIZE as u64);
+        let inode_table_bytes = (config.inodes_per_group as u64) * (INODE_SIZE as u64);
         let inode_table_blocks = inode_table_bytes.div_ceil(block_size);
         // Layout (block index → contents):
         //   0: padding + superblock (sb at byte 1024 within block)
@@ -162,7 +173,7 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
     // even though only inode 2 (root) actually has content.
     // Free count must match what the bitmap says or e2fsck flags
     // a "Free inodes count wrong" inconsistency.
-    let free_inodes = INODES_PER_GROUP - 10;
+    let free_inodes = config.inodes_per_group - 10;
 
     // Pinned-deterministic timestamp + UUID + hash seed. mkfs.ext4
     // pulls these from the clock + RNG; we pin them so format()
@@ -186,7 +197,7 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
 
     let sb = Superblock {
         block_size: config.block_size,
-        inodes_count: INODES_PER_GROUP,
+        inodes_count: config.inodes_per_group,
         blocks_count: total_blocks,
         free_blocks_count: free_blocks,
         free_inodes_count: free_inodes,
@@ -200,7 +211,7 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
         desc_size: 0, // ignored when 64BIT is clear
         first_data_block: 0,
         blocks_per_group,
-        inodes_per_group: INODES_PER_GROUP,
+        inodes_per_group: config.inodes_per_group,
         // Fields the kernel + e2fsck inspect during open. Setting
         // these to mke2fs-default values is what gets `e2fsck -nf`
         // to accept our output instead of rejecting it as a
@@ -353,7 +364,7 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
         bitmap::set_bit(&mut inode_bitmap_buf, i);
     }
     bitmap::set_bit(&mut inode_bitmap_buf, (ROOT_INODE_NUMBER - 1) as usize);
-    for i in (INODES_PER_GROUP as usize)..bitmap_capacity_bits {
+    for i in (config.inodes_per_group as usize)..bitmap_capacity_bits {
         bitmap::set_bit(&mut inode_bitmap_buf, i);
     }
     writer.seek(SeekFrom::Start(3 * layout.block_size))?;
@@ -399,7 +410,7 @@ mod tests {
         // The buffer now holds a valid ext4 image. Open it.
         let mut fs = Filesystem::open(Cursor::new(buf)).unwrap();
         assert_eq!(fs.superblock().block_size, 4096);
-        assert_eq!(fs.superblock().inodes_per_group, INODES_PER_GROUP);
+        assert_eq!(fs.superblock().inodes_per_group, 32);
 
         let root = fs.read_inode(ROOT_INODE).unwrap();
         assert_eq!(root.file_type(), InodeFileType::Directory);
@@ -601,8 +612,8 @@ mod tests {
                 bit + 1
             );
         }
-        // Bit 32 onward (past INODES_PER_GROUP): padding, must
-        // be set so allocators don't hand out non-existent
+        // Bit 32 onward (past inodes_per_group=32): padding,
+        // must be set so allocators don't hand out non-existent
         // indices.
         assert!(spec::bitmap::get_bit(bitmap_slice, 32));
         // Bits 10..32 represent unallocated user inodes — must
