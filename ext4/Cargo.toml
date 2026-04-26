@@ -2,9 +2,13 @@
 name        = "swe_justext4_ext4"
 version     = "0.1.0"
 description = "Read API over ext4 images. Filesystem<R: Read+Seek> opens an image, walks the inode table and extent trees, and returns file contents."
+readme      = "../README.md"
+keywords    = ["ext4", "filesystem", "image", "linux", "rootfs"]
+categories  = ["filesystem", "encoding", "parser-implementations"]
 edition.workspace      = true
 license.workspace      = true
 repository.workspace   = true
+homepage.workspace     = true
 authors.workspace      = true
 rust-version.workspace = true
 

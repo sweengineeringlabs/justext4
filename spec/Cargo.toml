@@ -2,9 +2,13 @@
 name        = "swe_justext4_spec"
 version     = "0.1.0"
 description = "On-disk format types for ext4 — superblock, group descriptor, inode, extent, dirent. Pure structs + decode/encode. No IO."
+readme      = "../README.md"
+keywords    = ["ext4", "filesystem", "encoding", "parser", "ondisk"]
+categories  = ["filesystem", "encoding", "parser-implementations"]
 edition.workspace      = true
 license.workspace      = true
 repository.workspace   = true
+homepage.workspace     = true
 authors.workspace      = true
 rust-version.workspace = true
 

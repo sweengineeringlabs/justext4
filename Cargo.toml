@@ -6,12 +6,16 @@ members = ["spec", "ext4", "cli"]
 edition      = "2021"
 license      = "Apache-2.0"
 repository   = "https://github.com/sweengineeringlabs/justext4"
+homepage     = "https://github.com/sweengineeringlabs/justext4"
 authors      = ["SWE Engineering Labs"]
 rust-version = "1.75"
 
 [workspace.dependencies]
-spec = { path = "spec", package = "swe_justext4_spec" }
-ext4 = { path = "ext4", package = "swe_justext4_ext4" }
+# `version` is required next to `path` so `cargo publish` can resolve
+# the dep against crates.io after stripping the path entry. Bump these
+# in lockstep with the per-crate `[package].version` of spec/ext4.
+spec = { path = "spec", package = "swe_justext4_spec", version = "0.1.0" }
+ext4 = { path = "ext4", package = "swe_justext4_ext4", version = "0.1.0" }
 
 # External — kept minimal. ext4 on-disk format is a packed binary
 # layout; the toolbox is bytes, slicing, and integer math. Pulling

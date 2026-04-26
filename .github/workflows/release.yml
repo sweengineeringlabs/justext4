@@ -1,0 +1,63 @@
+# Release workflow — publish each crate to crates.io on tag push.
+#
+# Operator must set CRATES_IO_TOKEN as a repo secret before tagging.
+# The token can be created at https://crates.io/me; it needs the
+# `publish-update` scope on each crate (swe_justext4_spec,
+# swe_justext4_ext4, swe_justext4_cli). Crate names must be claimed
+# under the `swe_justext4_*` prefix on the same crates.io account
+# the token belongs to before the first publish.
+#
+# Trigger: push of a tag matching `v*` (e.g. `v0.1.0`). Tag value is
+# informational here — `cargo publish` reads the version from each
+# crate's `[package].version`. Bump the per-crate versions in lockstep
+# with the tag.
+#
+# Order matters: `swe_justext4_ext4` depends on `swe_justext4_spec`,
+# and `swe_justext4_cli` depends on both. Each `cargo publish` step
+# must run sequentially so the dep is resolvable on crates.io by the
+# time the next step runs. crates.io's index propagation is usually
+# seconds; a small wait between steps protects against transient
+# index lag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish (spec → ext4 → cli)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo publish — spec (no path-deps)
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+        working-directory: spec
+
+      - name: Wait for crates.io index to refresh (spec)
+        # crates.io's sparse index is usually consistent within a few
+        # seconds of a successful publish, but the next step's resolver
+        # will fail if it queries the index before the new version is
+        # visible. A short wait is cheaper than retry logic.
+        run: sleep 30
+
+      - name: cargo publish — ext4 (depends on spec)
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+        working-directory: ext4
+
+      - name: Wait for crates.io index to refresh (ext4)
+        run: sleep 30
+
+      - name: cargo publish — cli (depends on ext4 + spec)
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+        working-directory: cli

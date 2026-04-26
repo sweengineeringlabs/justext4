@@ -2,9 +2,13 @@
 name        = "swe_justext4_cli"
 version     = "0.1.0"
 description = "mkext4-rs — operator CLI on top of swe_justext4_ext4. Format, inspect, touch, cat ext4 images entirely in pure Rust."
+readme      = "../README.md"
+keywords    = ["ext4", "filesystem", "cli", "mkfs", "image"]
+categories  = ["filesystem", "command-line-utilities"]
 edition.workspace      = true
 license.workspace      = true
 repository.workspace   = true
+homepage.workspace     = true
 authors.workspace      = true
 rust-version.workspace = true
 
