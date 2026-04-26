@@ -41,19 +41,27 @@ What's working:
 
 - **Read path**: superblock, group descriptors, inodes, extent trees,
   directory entries, file content, path resolution.
-- **Write path**: format an empty image, create regular files, allocate
-  inodes + data blocks, populate bitmaps correctly.
+- **Write path**: format empty images; `create_file` / `mkdir` /
+  `unlink` / `rmdir`; bitmap allocator; build-from-host-tree.
+- **Kernel interop, both directions**: we read real `mkfs.ext4`
+  output (committed fixture under `ext4/tests/fixtures/`), and our
+  output passes `e2fsck -nf` clean and is mountable by the Linux
+  kernel via `mount -o loop` (verified end-to-end).
+- **Reproducibility**: same `Config` produces byte-identical output
+  across runs (pinned timestamps + UUID + hash seed; pinned by an
+  always-on test).
 
 What's not yet:
 
-- `mkdir`, `unlink`, `truncate`, `rename`, symlinks
-- Multi-group images (single group only)
-- Block fragmentation (contiguous block allocation only)
-- Hash-tree directories (`EXT4_INDEX_FL`)
+- `truncate`, `rename`, `symlink`, `chmod`/`chown`, `utime`, xattr,
+  append/write-into-existing-file
+- Multi-group images (single group only — caps at ~128 MiB at 4 KiB
+  blocks)
+- Block fragmentation (contiguous-only allocator)
+- Hash-tree directories (`EXT4_INDEX_FL`) — large dirs can't enumerate
 - Inline-data inodes (`INLINE_DATA` feature)
-- Real `mkfs.ext4` fixture round-trip (we test against our own
-  formatter today; kernel-mountability not yet verified)
 - `METADATA_CSUM` / `64BIT` / journal features
+- crates.io publication
 
 ## Crates
 
