@@ -49,6 +49,12 @@ pub enum Ext4Error {
     #[error("not a directory: inode {inode}")]
     NotADirectory { inode: u32 },
 
+    /// `unlink` was called on a directory inode. Directories
+    /// have their own removal semantics (`rmdir`); unlink
+    /// rejects them to avoid orphaning the dir's content.
+    #[error("is a directory: inode {inode}")]
+    IsADirectory { inode: u32 },
+
     /// A creation operation found an entry already at the target
     /// name. Surfaces the colliding name so callers can prompt
     /// the user or pick a different filename.

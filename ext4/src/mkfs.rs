@@ -713,6 +713,97 @@ mod tests {
         assert!(matches!(err, Ext4Error::AlreadyExists { .. }));
     }
 
+    /// `unlink` removes a regular file: lookup misses after,
+    /// space frees, file is gone from parent listing.
+    ///
+    /// Bug it catches: a remove that updates the bitmap but
+    /// leaves the dir entry in place would have lookup still
+    /// succeed (returning a tombstoned inode); a remove that
+    /// updates the dir entry but not the bitmap would leak
+    /// the blocks and inode forever. The lookup-after-unlink
+    /// assertion is the user-facing contract; the free-count
+    /// delta proves the bookkeeping.
+    #[test]
+    fn test_unlink_removes_file_and_returns_space() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        let free_inodes_before = fs.superblock().free_inodes_count;
+        let free_blocks_before = fs.superblock().free_blocks_count;
+
+        fs.create_file("/scratch.txt", b"about to be deleted")
+            .unwrap();
+        fs.unlink("/scratch.txt").unwrap();
+
+        // Lookup must miss.
+        let root = fs.read_inode(ROOT_INODE).unwrap();
+        let err = fs.lookup(&root, b"scratch.txt").unwrap_err();
+        assert!(matches!(err, Ext4Error::NotFound { .. }));
+
+        // Free counts back to where they were before the create.
+        assert_eq!(fs.superblock().free_inodes_count, free_inodes_before);
+        assert_eq!(fs.superblock().free_blocks_count, free_blocks_before);
+    }
+
+    /// `unlink` rejects a directory inode with IsADirectory.
+    ///
+    /// Bug it catches: silently unlinking a directory orphans
+    /// every entry inside it (inodes still allocated, blocks
+    /// still owned, but no path to reach them). The kernel
+    /// requires `rmdir` for directories — we mirror that.
+    #[test]
+    fn test_unlink_directory_returns_is_a_directory() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.mkdir("/etc").unwrap();
+        let err = fs.unlink("/etc").unwrap_err();
+        assert!(matches!(err, Ext4Error::IsADirectory { .. }));
+    }
+
+    /// `unlink` of a missing entry returns NotFound.
+    #[test]
+    fn test_unlink_missing_file_returns_not_found() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        let err = fs.unlink("/never-existed").unwrap_err();
+        assert!(matches!(err, Ext4Error::NotFound { .. }));
+    }
+
+    /// After `unlink`, the freed inode + blocks become available
+    /// for a subsequent `create_file` of the same name.
+    ///
+    /// Bug it catches: a free that doesn't actually clear the
+    /// bitmap bits would make the next allocation either fail
+    /// (NoSpace despite plenty of room) or silently double-
+    /// allocate (allocator hands out the same blocks already
+    /// in use). The recreate-with-different-content test
+    /// distinguishes: if the bitmap clears worked, the new
+    /// file's content is what we just wrote; if not, content
+    /// would be whatever stale bytes remained.
+    #[test]
+    fn test_unlink_then_create_same_name_with_different_content() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+
+        fs.create_file("/log.txt", b"first version").unwrap();
+        fs.unlink("/log.txt").unwrap();
+        let new_inode = fs.create_file("/log.txt", b"second version").unwrap();
+
+        let inode = fs.read_inode(new_inode).unwrap();
+        let bytes = fs.read_file(&inode).unwrap();
+        assert_eq!(bytes, b"second version");
+    }
+
     /// Volume label round-trips through format → open.
     ///
     /// Bug it catches: a label setter that writes to the wrong

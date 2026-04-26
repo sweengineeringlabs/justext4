@@ -566,6 +566,202 @@ impl<R: Read + Seek> Filesystem<R> {
         Ok(())
     }
 
+    /// Free a contiguous run of `count` blocks starting at
+    /// `start` in group 0's block bitmap. Updates GDT + SB
+    /// free counts in memory (caller calls `flush_metadata` to
+    /// persist).
+    fn free_blocks(&mut self, start: u64, count: u32) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        if count == 0 {
+            return Ok(());
+        }
+        let block_size = self.superblock.block_size as u64;
+        let bitmap_block = self.gdt[0].block_bitmap;
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        let mut buf = vec![0u8; block_size as usize];
+        self.reader.read_exact(&mut buf)?;
+
+        for i in 0..count as usize {
+            bitmap::clear_bit(&mut buf, start as usize + i);
+        }
+
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        self.reader.write_all(&buf)?;
+
+        self.gdt[0].free_blocks_count += count;
+        self.superblock.free_blocks_count += count as u64;
+        Ok(())
+    }
+
+    /// Free an inode in group 0's inode bitmap. Updates GDT +
+    /// SB free counts in memory.
+    fn free_inode(&mut self, inode_number: u32) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let block_size = self.superblock.block_size as u64;
+        let bitmap_block = self.gdt[0].inode_bitmap;
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        let mut buf = vec![0u8; block_size as usize];
+        self.reader.read_exact(&mut buf)?;
+
+        bitmap::clear_bit(&mut buf, (inode_number - 1) as usize);
+
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        self.reader.write_all(&buf)?;
+
+        self.gdt[0].free_inodes_count += 1;
+        self.superblock.free_inodes_count += 1;
+        Ok(())
+    }
+
+    /// Remove the dir entry matching `(target_inode, name)` from
+    /// the parent's first data block.
+    ///
+    /// Removal strategy mirrors what the kernel does:
+    /// - If there's a preceding entry in the block, absorb the
+    ///   removed entry's `rec_len` into its predecessor's
+    ///   `rec_len`. The decoder's linear walk then skips the
+    ///   removed bytes naturally.
+    /// - If the target is the first entry (no predecessor),
+    ///   tombstone it: zero the `inode` field, keep `rec_len`
+    ///   intact. Walkers filter `is_unused()` entries on read.
+    fn remove_dir_entry(
+        &mut self,
+        parent_inode: &Inode,
+        target_inode: u32,
+        name: &[u8],
+    ) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let block_size = self.superblock.block_size as usize;
+        let physical =
+            self.resolve_logical_block(parent_inode, 0)?
+                .ok_or(Ext4Error::InvalidLayout {
+                    reason: "directory has no first data block",
+                })?;
+
+        let block_byte_offset = physical * block_size as u64;
+        self.reader.seek(SeekFrom::Start(block_byte_offset))?;
+        let mut block_buf = vec![0u8; block_size];
+        self.reader.read_exact(&mut block_buf)?;
+
+        let mut cursor = 0usize;
+        let mut prev_offset: Option<usize> = None;
+        let mut found_offset: Option<usize> = None;
+        let mut found_rec_len: u16 = 0;
+
+        while cursor < block_size {
+            let entry = DirEntry::decode(&block_buf[cursor..])?;
+            if !entry.is_unused() && entry.name == name && entry.inode == target_inode {
+                found_offset = Some(cursor);
+                found_rec_len = entry.rec_len;
+                break;
+            }
+            prev_offset = Some(cursor);
+            cursor += entry.rec_len as usize;
+        }
+
+        let target_offset = found_offset.ok_or_else(|| Ext4Error::NotFound {
+            name: name.to_vec(),
+        })?;
+
+        if let Some(prev_off) = prev_offset {
+            // Merge: prev's rec_len += target's rec_len.
+            let prev_entry = DirEntry::decode(&block_buf[prev_off..])?;
+            let new_prev_rec_len = prev_entry.rec_len + found_rec_len;
+            let mut updated = prev_entry;
+            updated.rec_len = new_prev_rec_len;
+            updated.encode_into(&mut block_buf[prev_off..prev_off + new_prev_rec_len as usize])?;
+        } else {
+            // First-entry tombstone: clear inode field. rec_len
+            // stays so the walker still strides correctly.
+            block_buf[target_offset..target_offset + 4].fill(0);
+        }
+
+        self.reader.seek(SeekFrom::Start(block_byte_offset))?;
+        self.reader.write_all(&block_buf)?;
+        Ok(())
+    }
+
+    /// Remove a regular file at `path`. Frees its inode + data
+    /// blocks, removes its dir entry from the parent.
+    ///
+    /// Refuses directories — `rmdir` (when added) handles those
+    /// with its own semantics (require empty, decrement parent's
+    /// links_count, etc.).
+    ///
+    /// v0 limits: assumes the file's data blocks live in a
+    /// single contiguous extent in `i_block` (the only shape
+    /// our `create_file` produces). Files written by an external
+    /// tool with depth>0 trees aren't supported yet — their
+    /// non-leaf node blocks would be leaked, marked uninit, or
+    /// decoded incorrectly.
+    pub fn unlink(&mut self, path: &str) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let (parent_path, filename) = Self::split_path(path)?;
+        let parent_inode_num = self.open_path(parent_path)?;
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: parent_inode_num,
+            });
+        }
+
+        // Locate the entry and the inode it references.
+        let target_inode_num = self.lookup(&parent_inode, filename.as_bytes())?;
+        let target_inode = self.read_inode(target_inode_num)?;
+        if target_inode.is_directory() {
+            return Err(Ext4Error::IsADirectory {
+                inode: target_inode_num,
+            });
+        }
+
+        // Free the data blocks. v0 only handles depth-0 (inline
+        // extent header) trees; anything deeper is a v0 limit
+        // documented above.
+        if target_inode.uses_extents() && target_inode.size > 0 {
+            let node = decode_extent_node(&target_inode.block)?;
+            if let ExtentNode::Leaf { extents, .. } = node {
+                for ext in extents {
+                    if !ext.uninit {
+                        self.free_blocks(ext.physical_block, ext.len as u32)?;
+                    }
+                }
+            }
+        }
+
+        // Free the inode bitmap bit.
+        self.free_inode(target_inode_num)?;
+
+        // Stamp the inode as deleted: links_count=0, dtime set,
+        // size+block cleared. The kernel's convention. e2fsck
+        // walks the inode table and validates that any entry
+        // with links_count=0 also has dtime set.
+        let mut deleted = target_inode;
+        deleted.links_count = 0;
+        deleted.dtime = 0x6500_0001;
+        deleted.size = 0;
+        deleted.flags = 0;
+        deleted.block = [0u8; I_BLOCK_LEN];
+        self.write_inode(target_inode_num, &deleted)?;
+
+        // Remove the dir entry from the parent.
+        self.remove_dir_entry(&parent_inode, target_inode_num, filename.as_bytes())?;
+
+        self.flush_metadata()?;
+        Ok(())
+    }
+
     /// Create an empty directory at `path`. Returns the new
     /// directory's inode number.
     ///

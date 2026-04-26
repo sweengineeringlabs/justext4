@@ -342,3 +342,85 @@ fn test_format_then_mkdir_then_nested_create_file_passes_e2fsck_clean() {
         "e2fsck found a problem requiring fix after mkdir"
     );
 }
+
+/// `format → create_file → unlink → e2fsck-clean`. Validates
+/// the unlink path against kernel-grade fsck.
+///
+/// Bug it catches: an unlink that fails to clear the inode
+/// bitmap (or block bitmap) leaks resources; e2fsck flags as
+/// "Free blocks count wrong" or "Free inodes count wrong" in
+/// pass 5. An unlink that leaves a tombstoned inode without
+/// dtime set fails pass 1 inode-state validation. An unlink
+/// that miscounts the parent dir's links fails pass 4.
+#[test]
+fn test_format_then_create_file_then_unlink_passes_e2fsck_clean() {
+    let runner = detect_runner();
+    if matches!(runner, E2fsckRunner::Unavailable) {
+        eprintln!(
+            "SKIP: e2fsck not on PATH and JUSTEXT4_E2FSCK_VIA_WSL not set; \
+             cannot validate post-unlink image state"
+        );
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "justext4-e2fsck-unlink-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("image.ext4");
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&img)
+        .unwrap();
+    format(&mut file, &Config::default()).unwrap();
+    drop(file);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img)
+        .unwrap();
+    let mut fs = Filesystem::open(file).unwrap();
+    fs.create_file("/scratch.txt", b"about to be deleted")
+        .unwrap();
+    fs.unlink("/scratch.txt").unwrap();
+    drop(fs);
+
+    let mut cmd = build_command(&runner, &img);
+    eprintln!("running: {cmd:?}");
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn e2fsck");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- e2fsck stdout ---\n{stdout}");
+    eprintln!("--- e2fsck stderr ---\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "e2fsck rejected post-unlink image (exit code: {:?})",
+        output.status.code()
+    );
+    assert!(
+        !stdout.contains("WARNING"),
+        "e2fsck flagged warnings after unlink; bitmap drift?"
+    );
+    assert!(
+        !stdout.contains("Fix?"),
+        "e2fsck found a problem requiring fix after unlink"
+    );
+}
