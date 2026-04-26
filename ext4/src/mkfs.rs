@@ -9,17 +9,23 @@
 //! Out of scope for v0:
 //!
 //! - Lost+found directory and the second standard inode (11).
-//! - Block / inode bitmap correctness — the bitmaps are emitted
-//!   as all-zero, which means the kernel would think every block
-//!   and inode is free even though some are in use. The kernel
-//!   will mount but `fsck` will flag the inconsistency. Bitmap
-//!   accounting lands when an allocator is needed (i.e. when we
-//!   start writing files into the image, not just creating it).
 //! - Journal (a JBD2-formatted file at a reserved inode).
 //! - Multiple block groups / large images.
 //! - `METADATA_CSUM` / `64BIT` features — produced images use
 //!   the simplest viable feature set so they round-trip cleanly
 //!   through the v0 decoders.
+//!
+//! **Known kernel-interop gap.** `e2fsck -nf <image>` rejects
+//! our output today with "superblock corrupt", because we don't
+//! emit several fields the kernel inspects: `s_state`,
+//! `s_creator_os`, `s_max_mnt_count`, last-mount/write/check
+//! timestamps, and a non-trivial feature-bit baseline. The
+//! v0 decoder doesn't read those fields either, so our
+//! round-trip still closes through *our* reader; closing it
+//! through `e2fsck` is a follow-up slice. The reverse
+//! direction is solid: see
+//! `tests/real_mkfs_roundtrip.rs` — we open and walk
+//! mke2fs-produced images correctly.
 //!
 //! What's enough for v0: produce something
 //! [`crate::Filesystem::open`] can consume,
