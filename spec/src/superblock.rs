@@ -27,19 +27,36 @@ const OFF_FREE_BLOCKS_COUNT_LO: usize = 0x0C;
 const OFF_FREE_INODES_COUNT: usize = 0x10;
 const OFF_FIRST_DATA_BLOCK: usize = 0x14;
 const OFF_LOG_BLOCK_SIZE: usize = 0x18;
+const OFF_LOG_CLUSTER_SIZE: usize = 0x1C;
 const OFF_BLOCKS_PER_GROUP: usize = 0x20;
+const OFF_CLUSTERS_PER_GROUP: usize = 0x24;
 const OFF_INODES_PER_GROUP: usize = 0x28;
-const OFF_REV_LEVEL: usize = 0x4C;
-const OFF_INODE_SIZE: usize = 0x58;
+const OFF_MTIME: usize = 0x2C;
+const OFF_WTIME: usize = 0x30;
+const OFF_MNT_COUNT: usize = 0x34;
+const OFF_MAX_MNT_COUNT: usize = 0x36;
 const OFF_MAGIC: usize = 0x38;
+const OFF_STATE: usize = 0x3A;
+const OFF_ERRORS: usize = 0x3C;
+const OFF_MINOR_REV_LEVEL: usize = 0x3E;
+const OFF_LASTCHECK: usize = 0x40;
+const OFF_CHECKINTERVAL: usize = 0x44;
+const OFF_CREATOR_OS: usize = 0x48;
+const OFF_REV_LEVEL: usize = 0x4C;
+const OFF_FIRST_INO: usize = 0x54;
+const OFF_INODE_SIZE: usize = 0x58;
 const OFF_FEATURE_COMPAT: usize = 0x5C;
 const OFF_FEATURE_INCOMPAT: usize = 0x60;
 const OFF_FEATURE_RO_COMPAT: usize = 0x64;
 const OFF_UUID: usize = 0x68;
 const OFF_VOLUME_NAME: usize = 0x78;
+const OFF_HASH_SEED: usize = 0xEC;
+const OFF_DEF_HASH_VERSION: usize = 0xFC;
 const OFF_DESC_SIZE: usize = 0xFE;
 const OFF_BLOCKS_COUNT_HI: usize = 0x150;
-const OFF_FREE_BLOCKS_COUNT_HI: usize = 0x154;
+// Note: 0x154 is `s_r_blocks_count_hi` (reserved blocks high half),
+// not free_blocks_count_hi. The free count's hi is at 0x158.
+const OFF_FREE_BLOCKS_COUNT_HI: usize = 0x158;
 
 /// Revision level at which `s_inode_size` and other dynamic fields
 /// became valid. Rev 0 has a fixed 128-byte inode and no dynamic
@@ -62,6 +79,44 @@ pub const FEATURE_INCOMPAT_64BIT: u32 = 0x80;
 /// kernel hard-codes this as `EXT4_MIN_DESC_SIZE`. Older ext2/3
 /// images and 32-bit ext4 images use it.
 pub const GDT_ENTRY_SIZE_32: u16 = 32;
+
+/// `s_state` value indicating a cleanly unmounted filesystem.
+/// `e2fsck` rejects images whose state is 0; this is the
+/// canonical "clean" value mke2fs writes.
+pub const EXT4_VALID_FS: u16 = 0x0001;
+
+/// `s_errors` policy: continue on non-fatal errors. The kernel
+/// requires `s_errors` to be in {1, 2, 3}; 1 (continue) is the
+/// most permissive and matches the mke2fs default.
+pub const EXT4_ERRORS_CONTINUE: u16 = 1;
+
+/// `s_creator_os` value for Linux. Most consumers ignore this,
+/// but `e2fsck` and the kernel use it to skip OS-specific
+/// quirks. Real mke2fs always writes 0.
+pub const EXT4_OS_LINUX: u32 = 0;
+
+/// `INCOMPAT_FILETYPE` — directory entries use the
+/// `ext4_dir_entry_2` layout (8-bit name_len + 8-bit file_type)
+/// rather than the legacy 16-bit name_len. Required by every
+/// ext4 image our decoder handles.
+pub const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
+
+/// `INCOMPAT_EXTENTS` — files use extent trees rather than the
+/// ext2/3 indirect-block scheme. Required for our v0 inode
+/// layout.
+pub const FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
+
+/// `RO_COMPAT_SPARSE_SUPER` — superblock backups live only in
+/// groups whose number is a power of {3, 5, 7}, not every group.
+/// Setting this lets mkfs / e2fsck skip looking for backups in
+/// the small groups our v0 produces. Real mke2fs always sets it.
+pub const FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+
+/// `s_def_hash_version` value: half_md4. The directory-entry
+/// hash function used when the dir-index feature is enabled.
+/// Even when our images don't use dir_index, e2fsck wants
+/// `s_def_hash_version` to be a recognised value.
+pub const EXT4_HASH_HALF_MD4: u8 = 1;
 
 /// Decoded ext4 superblock — only the v0 fields. Fields the higher
 /// layers do not yet need (mount counts, last-write timestamps,
@@ -134,6 +189,58 @@ pub struct Superblock {
     /// number into a (group, index) pair when locating it within
     /// the inode table.
     pub inodes_per_group: u32,
+
+    /// `s_mtime` — last mount time (seconds since epoch). Read by
+    /// `e2fsck` to decide whether to run a consistency check.
+    pub mtime: u32,
+
+    /// `s_wtime` — last write time.
+    pub wtime: u32,
+
+    /// `s_mnt_count` — count of times the FS has been mounted
+    /// since the last fsck. The kernel increments on mount.
+    pub mount_count: u16,
+
+    /// `s_max_mnt_count` — mounts permitted before fsck is
+    /// forced. `mke2fs` sets this to `-1` (unsigned 0xFFFF) to
+    /// disable the time-based fsck cron.
+    pub max_mount_count: u16,
+
+    /// `s_state` — see [`EXT4_VALID_FS`]. `e2fsck` rejects
+    /// images whose state isn't a recognised value.
+    pub state: u16,
+
+    /// `s_errors` — policy when the kernel detects an error.
+    /// 1 = continue, 2 = remount read-only, 3 = panic. Must be
+    /// set to a recognised value for `e2fsck` to accept.
+    pub errors: u16,
+
+    /// `s_minor_rev_level` — 0 for current ext4.
+    pub minor_rev_level: u16,
+
+    /// `s_lastcheck` — last fsck time.
+    pub last_check: u32,
+
+    /// `s_checkinterval` — max seconds between fsck. `mke2fs`
+    /// sets this to 0 (no automatic check) by default.
+    pub check_interval: u32,
+
+    /// `s_creator_os` — see [`EXT4_OS_LINUX`].
+    pub creator_os: u32,
+
+    /// `s_first_ino` — first non-reserved inode number.
+    /// The kernel reserves 1..s_first_ino for itself; users
+    /// allocate from `first_ino` upward. `mke2fs` sets this to
+    /// 11 (= reserve inodes 1..10).
+    pub first_ino: u32,
+
+    /// `s_hash_seed` — 16-byte seed for the directory-entry
+    /// hash. Even when dir_index is off, `e2fsck` validates the
+    /// seed if `s_def_hash_version` is set.
+    pub hash_seed: [u8; 16],
+
+    /// `s_def_hash_version` — see [`EXT4_HASH_HALF_MD4`].
+    pub def_hash_version: u8,
 }
 
 impl Superblock {
@@ -197,6 +304,9 @@ impl Superblock {
         let mut volume_name = [0u8; 16];
         volume_name.copy_from_slice(&buf[OFF_VOLUME_NAME..OFF_VOLUME_NAME + 16]);
 
+        let mut hash_seed = [0u8; 16];
+        hash_seed.copy_from_slice(&buf[OFF_HASH_SEED..OFF_HASH_SEED + 16]);
+
         Ok(Superblock {
             block_size,
             inodes_count: read_u32(buf, OFF_INODES_COUNT),
@@ -214,6 +324,19 @@ impl Superblock {
             first_data_block: read_u32(buf, OFF_FIRST_DATA_BLOCK),
             blocks_per_group: read_u32(buf, OFF_BLOCKS_PER_GROUP),
             inodes_per_group: read_u32(buf, OFF_INODES_PER_GROUP),
+            mtime: read_u32(buf, OFF_MTIME),
+            wtime: read_u32(buf, OFF_WTIME),
+            mount_count: read_u16(buf, OFF_MNT_COUNT),
+            max_mount_count: read_u16(buf, OFF_MAX_MNT_COUNT),
+            state: read_u16(buf, OFF_STATE),
+            errors: read_u16(buf, OFF_ERRORS),
+            minor_rev_level: read_u16(buf, OFF_MINOR_REV_LEVEL),
+            last_check: read_u32(buf, OFF_LASTCHECK),
+            check_interval: read_u32(buf, OFF_CHECKINTERVAL),
+            creator_os: read_u32(buf, OFF_CREATOR_OS),
+            first_ino: read_u32(buf, OFF_FIRST_INO),
+            hash_seed,
+            def_hash_version: buf[OFF_DEF_HASH_VERSION],
         })
     }
 
@@ -299,16 +422,34 @@ impl Superblock {
         write_u32(buf, OFF_FREE_INODES_COUNT, self.free_inodes_count);
         write_u32(buf, OFF_FIRST_DATA_BLOCK, self.first_data_block);
         write_u32(buf, OFF_LOG_BLOCK_SIZE, log_block_size);
+        // bigalloc not supported — clusters are 1:1 with blocks.
+        // The kernel + e2fsck validate cluster_size == block_size
+        // when feature_ro_compat::BIGALLOC is clear.
+        write_u32(buf, OFF_LOG_CLUSTER_SIZE, log_block_size);
         write_u32(buf, OFF_BLOCKS_PER_GROUP, self.blocks_per_group);
+        write_u32(buf, OFF_CLUSTERS_PER_GROUP, self.blocks_per_group);
         write_u32(buf, OFF_INODES_PER_GROUP, self.inodes_per_group);
+        write_u32(buf, OFF_MTIME, self.mtime);
+        write_u32(buf, OFF_WTIME, self.wtime);
+        write_u16(buf, OFF_MNT_COUNT, self.mount_count);
+        write_u16(buf, OFF_MAX_MNT_COUNT, self.max_mount_count);
         write_u16(buf, OFF_MAGIC, EXT4_MAGIC);
+        write_u16(buf, OFF_STATE, self.state);
+        write_u16(buf, OFF_ERRORS, self.errors);
+        write_u16(buf, OFF_MINOR_REV_LEVEL, self.minor_rev_level);
+        write_u32(buf, OFF_LASTCHECK, self.last_check);
+        write_u32(buf, OFF_CHECKINTERVAL, self.check_interval);
+        write_u32(buf, OFF_CREATOR_OS, self.creator_os);
         write_u32(buf, OFF_REV_LEVEL, self.rev_level);
+        write_u32(buf, OFF_FIRST_INO, self.first_ino);
         write_u16(buf, OFF_INODE_SIZE, self.inode_size);
         write_u32(buf, OFF_FEATURE_COMPAT, self.feature_compat);
         write_u32(buf, OFF_FEATURE_INCOMPAT, self.feature_incompat);
         write_u32(buf, OFF_FEATURE_RO_COMPAT, self.feature_ro_compat);
         buf[OFF_UUID..OFF_UUID + 16].copy_from_slice(&self.uuid);
         buf[OFF_VOLUME_NAME..OFF_VOLUME_NAME + 16].copy_from_slice(&self.volume_name);
+        buf[OFF_HASH_SEED..OFF_HASH_SEED + 16].copy_from_slice(&self.hash_seed);
+        buf[OFF_DEF_HASH_VERSION] = self.def_hash_version;
         write_u16(buf, OFF_DESC_SIZE, self.desc_size);
 
         // 64-bit hi-words land only when the feature is set; on

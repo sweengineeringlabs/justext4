@@ -15,17 +15,26 @@
 //!   the simplest viable feature set so they round-trip cleanly
 //!   through the v0 decoders.
 //!
-//! **Known kernel-interop gap.** `e2fsck -nf <image>` rejects
-//! our output today with "superblock corrupt", because we don't
-//! emit several fields the kernel inspects: `s_state`,
-//! `s_creator_os`, `s_max_mnt_count`, last-mount/write/check
-//! timestamps, and a non-trivial feature-bit baseline. The
-//! v0 decoder doesn't read those fields either, so our
-//! round-trip still closes through *our* reader; closing it
-//! through `e2fsck` is a follow-up slice. The reverse
-//! direction is solid: see
-//! `tests/real_mkfs_roundtrip.rs` — we open and walk
-//! mke2fs-produced images correctly.
+//! **Kernel interop**: closed in both directions.
+//!
+//! - We open + walk real `mke2fs`-produced images
+//!   (`tests/real_mkfs_roundtrip.rs`).
+//! - `e2fsck -nf` accepts our output as a clean filesystem
+//!   (`tests/e2fsck_acceptance.rs`, gated `#[ignore]`).
+//! - The Linux kernel mounts our output as a real ext4
+//!   filesystem (manual verification: `mount -o loop ...`).
+//!
+//! Getting there required emitting the fields the kernel +
+//! e2fsck inspect that the v0 decoder doesn't itself need:
+//! `s_state`, `s_errors`, `s_creator_os`, `s_first_ino`,
+//! `s_max_mnt_count`, `s_log_cluster_size` (= log_block_size
+//! when bigalloc is off), `s_clusters_per_group` (=
+//! blocks_per_group), a non-zero UUID, hash seed, and the
+//! `INCOMPAT_FILETYPE`, `INCOMPAT_EXTENTS`,
+//! `RO_COMPAT_SPARSE_SUPER` feature bits. Plus bitmap
+//! correctness: reserved-inode range marked used, padding past
+//! the in-use range marked used, free counts matching the
+//! bitmaps.
 //!
 //! What's enough for v0: produce something
 //! [`crate::Filesystem::open`] can consume,
@@ -37,8 +46,10 @@
 use std::io::{Seek, SeekFrom, Write};
 
 use spec::{
-    bitmap, DirEntry, Extent, ExtentHeader, GroupDescriptor, Inode, Superblock, INODE_FLAG_EXTENTS,
-    I_BLOCK_LEN, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+    bitmap, DirEntry, Extent, ExtentHeader, GroupDescriptor, Inode, Superblock,
+    EXT4_ERRORS_CONTINUE, EXT4_HASH_HALF_MD4, EXT4_OS_LINUX, EXT4_VALID_FS,
+    FEATURE_INCOMPAT_EXTENTS, FEATURE_INCOMPAT_FILETYPE, FEATURE_RO_COMPAT_SPARSE_SUPER,
+    INODE_FLAG_EXTENTS, I_BLOCK_LEN, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 
 use crate::error::Ext4Error;
@@ -146,9 +157,32 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
     volume_name[..label_len].copy_from_slice(&config.volume_label[..label_len]);
 
     let free_blocks = total_blocks - layout.metadata_blocks;
-    // free inodes = total - 1 (only root inode is allocated for
-    // v0 — the other reserved inode slots remain zeroed).
-    let free_inodes = INODES_PER_GROUP - 1;
+    // Free inodes = total - 10. The 10 reserved inodes (1..=10)
+    // are marked used in the bitmap because e2fsck demands it,
+    // even though only inode 2 (root) actually has content.
+    // Free count must match what the bitmap says or e2fsck flags
+    // a "Free inodes count wrong" inconsistency.
+    let free_inodes = INODES_PER_GROUP - 10;
+
+    // Pinned-deterministic timestamp + UUID + hash seed. mkfs.ext4
+    // pulls these from the clock + RNG; we pin them so format()
+    // output is byte-stable across runs (the same Config produces
+    // the same image bytes). Reproducibility is a project guarantee.
+    const PINNED_TIME: u32 = 0x6500_0000; // 2023-09-13 in posix epoch
+    const PINNED_UUID: [u8; 16] = [
+        0x6A, 0x75, 0x73, 0x74, 0x65, 0x78, 0x74, 0x34, 0x76, 0x30, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA,
+        0xFE,
+    ];
+    const PINNED_HASH_SEED: [u8; 16] = [
+        0xEC, 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+        0xDE,
+    ];
+
+    // Kernel convention: blocks_per_group = block_size * 8 (one
+    // group's worth of blocks fits in a single block-bitmap
+    // block). The total `size_blocks` decides how many groups
+    // we need (typically 1 for tiny images).
+    let blocks_per_group = config.block_size * 8;
 
     let sb = Superblock {
         block_size: config.block_size,
@@ -159,14 +193,31 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
         inode_size: INODE_SIZE,
         rev_level: 1,
         feature_compat: 0,
-        feature_incompat: 0,
-        feature_ro_compat: 0,
-        uuid: [0; 16],
+        feature_incompat: FEATURE_INCOMPAT_FILETYPE | FEATURE_INCOMPAT_EXTENTS,
+        feature_ro_compat: FEATURE_RO_COMPAT_SPARSE_SUPER,
+        uuid: PINNED_UUID,
         volume_name,
         desc_size: 0, // ignored when 64BIT is clear
         first_data_block: 0,
-        blocks_per_group: config.size_blocks,
+        blocks_per_group,
         inodes_per_group: INODES_PER_GROUP,
+        // Fields the kernel + e2fsck inspect during open. Setting
+        // these to mke2fs-default values is what gets `e2fsck -nf`
+        // to accept our output instead of rejecting it as a
+        // corrupt superblock.
+        mtime: 0,
+        wtime: PINNED_TIME,
+        mount_count: 0,
+        max_mount_count: 0xFFFF, // -1 as i16: disable mount-count fsck
+        state: EXT4_VALID_FS,
+        errors: EXT4_ERRORS_CONTINUE,
+        minor_rev_level: 0,
+        last_check: PINNED_TIME,
+        check_interval: 0,
+        creator_os: EXT4_OS_LINUX,
+        first_ino: 11, // standard reserved-inode count
+        hash_seed: PINNED_HASH_SEED,
+        def_hash_version: EXT4_HASH_HALF_MD4,
     };
 
     // ── group descriptor (single entry) ────────────────────────
@@ -269,22 +320,42 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
     writer.seek(SeekFrom::Start(layout.root_dir_block * layout.block_size))?;
     writer.write_all(&block_buf)?;
 
-    // Block bitmap at block 2: mark blocks 0..metadata_blocks as
-    // used (block-0 padding/superblock, GDT, both bitmap blocks,
-    // inode table blocks, root dir data block). Without this the
-    // kernel would consider every block free and an allocator
-    // running over the FS would hand out blocks already in use.
+    // Block bitmap at block 2. Two regions get set:
+    //  1. blocks 0..metadata_blocks — actually allocated (sb,
+    //     GDT, both bitmaps, inode table, root dir).
+    //  2. bits past the FS end, up through the bitmap-block
+    //     boundary — the kernel calls this "padding"; bits
+    //     marked used so allocators never hand out non-existent
+    //     blocks. e2fsck warns when it's missing.
     let mut block_bitmap_buf = vec![0u8; config.block_size as usize];
     for i in 0..layout.metadata_blocks {
         bitmap::set_bit(&mut block_bitmap_buf, i as usize);
     }
+    let bitmap_capacity_bits = (config.block_size as usize) * 8;
+    for i in (total_blocks as usize)..bitmap_capacity_bits {
+        bitmap::set_bit(&mut block_bitmap_buf, i);
+    }
     writer.seek(SeekFrom::Start(2 * layout.block_size))?;
     writer.write_all(&block_bitmap_buf)?;
 
-    // Inode bitmap at block 3: mark inode 2 (root) as used.
-    // Bit index = inode_number - 1 (inodes are 1-indexed).
+    // Inode bitmap at block 3. Three regions get set:
+    //  1. The 10 reserved inodes (1..=10). The kernel hard-
+    //     reserves these on every ext-family FS regardless of
+    //     whether it actually uses them; e2fsck demands they be
+    //     marked used.
+    //  2. Inode 2 (root) — already covered by the reserved range
+    //     but conceptually our actual allocation.
+    //  3. Padding past inodes_per_group, same as for the block
+    //     bitmap: prevents allocators from handing out indices
+    //     that have no inode-table slot.
     let mut inode_bitmap_buf = vec![0u8; config.block_size as usize];
+    for i in 0..10 {
+        bitmap::set_bit(&mut inode_bitmap_buf, i);
+    }
     bitmap::set_bit(&mut inode_bitmap_buf, (ROOT_INODE_NUMBER - 1) as usize);
+    for i in (INODES_PER_GROUP as usize)..bitmap_capacity_bits {
+        bitmap::set_bit(&mut inode_bitmap_buf, i);
+    }
     writer.seek(SeekFrom::Start(3 * layout.block_size))?;
     writer.write_all(&inode_bitmap_buf)?;
 
@@ -506,18 +577,43 @@ mod tests {
         assert!(!spec::bitmap::get_bit(bitmap_slice, 7));
     }
 
-    /// Inode bitmap marks inode 2 (root) as used after format.
+    /// Inode bitmap marks the 10 reserved inodes (1..=10) as
+    /// used after format, plus pads bits past the in-use range
+    /// up to the bitmap-block boundary.
+    ///
+    /// Bug it catches: e2fsck demands the conventional reserved-
+    /// inode range be marked used regardless of whether the FS
+    /// actually allocated content there. A formatter that only
+    /// marks the inodes it really uses (just root, in our v0)
+    /// produces e2fsck-rejected output.
     #[test]
-    fn test_format_inode_bitmap_marks_root_inode_used() {
+    fn test_format_inode_bitmap_marks_reserved_range_used_and_pads_tail() {
         let mut buf: Vec<u8> = Vec::new();
         let mut cursor = Cursor::new(&mut buf);
         format(&mut cursor, &Config::default()).unwrap();
-        // Block 3 holds the inode bitmap. Inode 2 = bit 1.
         let bitmap_offset = 3 * 4096;
         let bitmap_slice = &buf[bitmap_offset..bitmap_offset + 4096];
-        assert!(spec::bitmap::get_bit(bitmap_slice, 1));
-        assert!(!spec::bitmap::get_bit(bitmap_slice, 0));
-        assert!(!spec::bitmap::get_bit(bitmap_slice, 2));
+        // Bits 0..10 (inodes 1..10): reserved range, must be set.
+        for bit in 0..10 {
+            assert!(
+                spec::bitmap::get_bit(bitmap_slice, bit),
+                "reserved inode {} should be marked used",
+                bit + 1
+            );
+        }
+        // Bit 32 onward (past INODES_PER_GROUP): padding, must
+        // be set so allocators don't hand out non-existent
+        // indices.
+        assert!(spec::bitmap::get_bit(bitmap_slice, 32));
+        // Bits 10..32 represent unallocated user inodes — must
+        // be clear (free).
+        for bit in 10..32 {
+            assert!(
+                !spec::bitmap::get_bit(bitmap_slice, bit),
+                "user inode {} should be free",
+                bit + 1
+            );
+        }
     }
 
     /// Volume label round-trips through format → open.
