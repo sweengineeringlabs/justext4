@@ -9,10 +9,15 @@
 //! `bg_*` / `i_*` conventions where practical so cross-referencing
 //! the kernel source is straightforward.
 
+pub mod extent;
 pub mod group_descriptor;
 pub mod inode;
 pub mod superblock;
 
+pub use extent::{
+    decode_extent_node, Extent, ExtentDecodeError, ExtentHeader, ExtentIndex, ExtentNode,
+    EXTENT_ENTRY_SIZE, EXTENT_HEADER_MAGIC, EXTENT_HEADER_SIZE,
+};
 pub use group_descriptor::{
     GroupDescriptor, GroupDescriptorDecodeError, BG_FLAG_BLOCK_UNINIT, BG_FLAG_INODE_UNINIT,
     BG_FLAG_INODE_ZEROED,
