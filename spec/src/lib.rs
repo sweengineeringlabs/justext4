@@ -9,6 +9,7 @@
 //! `bg_*` / `i_*` conventions where practical so cross-referencing
 //! the kernel source is straightforward.
 
+pub mod bitmap;
 pub mod dir_entry;
 pub mod extent;
 pub mod group_descriptor;

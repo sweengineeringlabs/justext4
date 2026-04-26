@@ -31,7 +31,7 @@
 use std::io::{Seek, SeekFrom, Write};
 
 use spec::{
-    DirEntry, Extent, ExtentHeader, GroupDescriptor, Inode, Superblock, INODE_FLAG_EXTENTS,
+    bitmap, DirEntry, Extent, ExtentHeader, GroupDescriptor, Inode, Superblock, INODE_FLAG_EXTENTS,
     I_BLOCK_LEN, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 
@@ -263,6 +263,25 @@ pub fn format<W: Write + Seek>(writer: &mut W, config: &Config) -> Result<(), Ex
     writer.seek(SeekFrom::Start(layout.root_dir_block * layout.block_size))?;
     writer.write_all(&block_buf)?;
 
+    // Block bitmap at block 2: mark blocks 0..metadata_blocks as
+    // used (block-0 padding/superblock, GDT, both bitmap blocks,
+    // inode table blocks, root dir data block). Without this the
+    // kernel would consider every block free and an allocator
+    // running over the FS would hand out blocks already in use.
+    let mut block_bitmap_buf = vec![0u8; config.block_size as usize];
+    for i in 0..layout.metadata_blocks {
+        bitmap::set_bit(&mut block_bitmap_buf, i as usize);
+    }
+    writer.seek(SeekFrom::Start(2 * layout.block_size))?;
+    writer.write_all(&block_bitmap_buf)?;
+
+    // Inode bitmap at block 3: mark inode 2 (root) as used.
+    // Bit index = inode_number - 1 (inodes are 1-indexed).
+    let mut inode_bitmap_buf = vec![0u8; config.block_size as usize];
+    bitmap::set_bit(&mut inode_bitmap_buf, (ROOT_INODE_NUMBER - 1) as usize);
+    writer.seek(SeekFrom::Start(3 * layout.block_size))?;
+    writer.write_all(&inode_bitmap_buf)?;
+
     // Pad image up to total_blocks * block_size by writing one
     // zero at the last byte. Required because mid-stream seeks
     // don't extend the underlying buffer; a Filesystem::open on
@@ -366,6 +385,133 @@ mod tests {
         };
         let err = format(&mut cursor, &config).unwrap_err();
         assert!(matches!(err, Ext4Error::InvalidLayout { .. }));
+    }
+
+    /// **The headline write-path demo.** Format an empty image,
+    /// create a file in it, and read the bytes back — all
+    /// in-process, no `mkfs.ext4`, no `cp`, no kernel mount.
+    ///
+    /// Bug it catches: any encode/decode asymmetry along the
+    /// allocator → inode-write → data-write → dir-entry-add chain
+    /// surfaces here. Each phase has its own unit test, but only
+    /// the integration shows that the phases compose: an inode
+    /// number allocated at one bit position has its corresponding
+    /// table slot write find the right physical offset, and the
+    /// dir entry pointing at it lets a subsequent open_path find
+    /// it again.
+    #[test]
+    fn test_format_then_create_file_then_read_back_round_trips() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        // Larger image needed — default config's 16 blocks leave
+        // exactly 1 free data block (block 7, after metadata at
+        // 0..6 and root dir at 6 — wait, root dir is at block 6
+        // in default config? Let me give more room).
+        // Actually default config has size_blocks = 16; metadata
+        // blocks = 7 (blocks 0..6 inclusive), root dir at block 6,
+        // so blocks 7..15 are free (9 blocks). Plenty for a small
+        // file.
+        let payload = b"hello, ext4!";
+
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+        let new_inode_num = fs.create_file("/hello.txt", payload).unwrap();
+
+        // Read back via lookup + read_file.
+        let root = fs.read_inode(ROOT_INODE).unwrap();
+        let looked_up = fs.lookup(&root, b"hello.txt").unwrap();
+        assert_eq!(looked_up, new_inode_num);
+
+        let inode = fs.read_inode(new_inode_num).unwrap();
+        assert!(inode.is_regular());
+        assert_eq!(inode.size, payload.len() as u64);
+
+        let read_back = fs.read_file(&inode).unwrap();
+        assert_eq!(read_back, payload);
+
+        // Also verify open_path resolves.
+        assert_eq!(fs.open_path("/hello.txt").unwrap(), new_inode_num);
+    }
+
+    /// `create_file` rejects a name that already exists in the
+    /// parent directory.
+    ///
+    /// Bug it catches: a creation that silently overwrites would
+    /// orphan the previous inode (its blocks + bitmap bits remain
+    /// allocated, the dir entry no longer references it). This is
+    /// a leak-class bug; the typed AlreadyExists routes the
+    /// caller to handle the conflict explicitly.
+    #[test]
+    fn test_create_file_rejects_collision_with_existing_entry() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+        fs.create_file("/foo", b"first").unwrap();
+        let err = fs.create_file("/foo", b"second").unwrap_err();
+        assert!(matches!(err, Ext4Error::AlreadyExists { .. }));
+    }
+
+    /// Multiple files round-trip — verifies the bitmap allocator
+    /// finds non-overlapping inodes/blocks for each call.
+    ///
+    /// Bug it catches: a stateless allocator that always returns
+    /// the same starting bit (forgetting to write the bitmap
+    /// back, or re-reading from the original on each call)
+    /// would hand out the same inode/blocks twice, corrupting
+    /// the second file's metadata.
+    #[test]
+    fn test_create_two_files_get_distinct_inodes_and_blocks() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        let mut fs = Filesystem::open(Cursor::new(&mut buf)).unwrap();
+        let i1 = fs.create_file("/a.txt", b"AAA").unwrap();
+        let i2 = fs.create_file("/b.txt", b"BBBBBB").unwrap();
+        assert_ne!(i1, i2);
+        let a = fs.read_inode(i1).unwrap();
+        let b = fs.read_inode(i2).unwrap();
+        assert_eq!(fs.read_file(&a).unwrap(), b"AAA");
+        assert_eq!(fs.read_file(&b).unwrap(), b"BBBBBB");
+    }
+
+    /// Block bitmap reflects the metadata range after format —
+    /// allocator can't hand out blocks 0..metadata_blocks, the
+    /// kernel won't double-allocate them, fsck won't complain.
+    #[test]
+    fn test_format_block_bitmap_marks_metadata_range_used() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+
+        // Block 2 holds the block bitmap; metadata occupies
+        // blocks 0..7 (sb-block, GDT, blockbitmap, inodebitmap,
+        // 2 inode-table blocks, root dir = 7 blocks total).
+        let bitmap_offset = 2 * 4096;
+        let bitmap_slice = &buf[bitmap_offset..bitmap_offset + 4096];
+        for bit in 0..7 {
+            assert!(
+                spec::bitmap::get_bit(bitmap_slice, bit),
+                "block {} should be marked used",
+                bit
+            );
+        }
+        // First free block.
+        assert!(!spec::bitmap::get_bit(bitmap_slice, 7));
+    }
+
+    /// Inode bitmap marks inode 2 (root) as used after format.
+    #[test]
+    fn test_format_inode_bitmap_marks_root_inode_used() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        format(&mut cursor, &Config::default()).unwrap();
+        // Block 3 holds the inode bitmap. Inode 2 = bit 1.
+        let bitmap_offset = 3 * 4096;
+        let bitmap_slice = &buf[bitmap_offset..bitmap_offset + 4096];
+        assert!(spec::bitmap::get_bit(bitmap_slice, 1));
+        assert!(!spec::bitmap::get_bit(bitmap_slice, 0));
+        assert!(!spec::bitmap::get_bit(bitmap_slice, 2));
     }
 
     /// Volume label round-trips through format → open.

@@ -1,10 +1,11 @@
 //! Filesystem handle — open an image, read inodes by number.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use spec::{
-    decode_dir_block, decode_extent_node, DirEntry, ExtentNode, GroupDescriptor, Inode, Superblock,
-    SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+    bitmap, decode_dir_block, decode_extent_node, DirEntry, Extent, ExtentHeader, ExtentNode,
+    GroupDescriptor, Inode, Superblock, INODE_FLAG_EXTENTS, I_BLOCK_LEN, SUPERBLOCK_OFFSET,
+    SUPERBLOCK_SIZE,
 };
 
 /// Inode number of the root directory. The kernel reserves
@@ -309,6 +310,30 @@ impl<R: Read + Seek> Filesystem<R> {
         })
     }
 
+    /// Split an absolute path into `(parent_path, filename)`.
+    /// `/` is rejected (no final component); paths without a
+    /// leading `/` are rejected (relative paths not supported).
+    fn split_path(path: &str) -> Result<(&str, &str), Ext4Error> {
+        if !path.starts_with('/') {
+            return Err(Ext4Error::InvalidLayout {
+                reason: "path must be absolute (start with '/')",
+            });
+        }
+        let trimmed = path.trim_end_matches('/');
+        let idx = trimmed.rfind('/').ok_or(Ext4Error::InvalidLayout {
+            reason: "path has no final component",
+        })?;
+        let filename = &trimmed[idx + 1..];
+        if filename.is_empty() {
+            return Err(Ext4Error::InvalidLayout {
+                reason: "path has no final component",
+            });
+        }
+        let parent = &trimmed[..idx];
+        let parent = if parent.is_empty() { "/" } else { parent };
+        Ok((parent, filename))
+    }
+
     /// Resolve an absolute path to an inode number. Walks
     /// component-by-component starting at the root inode (`/`).
     /// `path = "/"` returns [`ROOT_INODE`]. Empty components from
@@ -331,6 +356,324 @@ impl<R: Read + Seek> Filesystem<R> {
         }
         Ok(current)
     }
+
+    // ────────────────────────────────────────────────────────────
+    // Write API. Bound by `where R: Write` so the read-only path
+    // stays usable on `R: Read + Seek` readers without the Write
+    // capability.
+    // ────────────────────────────────────────────────────────────
+
+    /// Encode an inode and write it back to its slot in the
+    /// inode table. Caller computes the inode number; this
+    /// method handles the (group, index) → byte-offset
+    /// arithmetic.
+    fn write_inode(&mut self, inode_number: u32, inode: &Inode) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        if inode_number == 0 || inode_number > self.superblock.inodes_count {
+            return Err(Ext4Error::InodeOutOfRange {
+                inode: inode_number,
+                max: self.superblock.inodes_count,
+            });
+        }
+        let zero_based = inode_number - 1;
+        let group = zero_based / self.superblock.inodes_per_group;
+        let index_in_group = zero_based % self.superblock.inodes_per_group;
+        let group_idx = group as usize;
+        let inode_table_block = self.gdt[group_idx].inode_table;
+        let block_size = self.superblock.block_size as u64;
+        let inode_size = self.superblock.inode_size as u64;
+        let offset = inode_table_block * block_size + (index_in_group as u64) * inode_size;
+
+        let mut buf = vec![0u8; inode_size as usize];
+        inode.encode_into(&mut buf, &self.superblock)?;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Re-encode and write back the superblock and every GDT
+    /// entry. Called after any allocation to keep on-disk state
+    /// consistent with our in-memory copies.
+    fn flush_metadata(&mut self) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let mut sb_buf = vec![0u8; SUPERBLOCK_SIZE];
+        self.superblock.encode_into(&mut sb_buf)?;
+        self.reader.seek(SeekFrom::Start(SUPERBLOCK_OFFSET))?;
+        self.reader.write_all(&sb_buf)?;
+
+        let block_size = self.superblock.block_size as u64;
+        let entry_size = self.superblock.group_descriptor_size() as usize;
+        let gdt_offset = (self.superblock.first_data_block as u64 + 1) * block_size;
+        self.reader.seek(SeekFrom::Start(gdt_offset))?;
+        let mut gd_buf = vec![0u8; entry_size];
+        for gd in &self.gdt {
+            gd.encode_into(&mut gd_buf, &self.superblock)?;
+            self.reader.write_all(&gd_buf)?;
+        }
+        Ok(())
+    }
+
+    /// Allocate a new inode from group 0's inode bitmap.
+    /// Returns the 1-based inode number; updates the in-memory
+    /// GDT and superblock free counts and writes the modified
+    /// bitmap back to disk.
+    ///
+    /// v0 only operates on group 0. Multi-group allocation is a
+    /// follow-up.
+    fn allocate_inode(&mut self) -> Result<u32, Ext4Error>
+    where
+        R: Write,
+    {
+        let block_size = self.superblock.block_size as u64;
+        let bitmap_block = self.gdt[0].inode_bitmap;
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        let mut buf = vec![0u8; block_size as usize];
+        self.reader.read_exact(&mut buf)?;
+
+        let max_bit = self.superblock.inodes_per_group as usize;
+        let bit =
+            bitmap::find_first_zero(&buf, max_bit).ok_or(Ext4Error::NoSpace { what: "inodes" })?;
+        bitmap::set_bit(&mut buf, bit);
+
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        self.reader.write_all(&buf)?;
+
+        self.gdt[0].free_inodes_count = self.gdt[0].free_inodes_count.saturating_sub(1);
+        self.superblock.free_inodes_count = self.superblock.free_inodes_count.saturating_sub(1);
+
+        Ok((bit + 1) as u32)
+    }
+
+    /// Allocate a contiguous run of `count` blocks from group 0's
+    /// block bitmap. Returns the starting physical block number.
+    ///
+    /// `count = 0` returns physical 0 (vacuous; callers
+    /// computing `n_blocks = data.len().div_ceil(block_size)`
+    /// for an empty file are not penalised). Bitmap is unchanged
+    /// in that case.
+    fn allocate_blocks_contiguous(&mut self, count: u32) -> Result<u64, Ext4Error>
+    where
+        R: Write,
+    {
+        if count == 0 {
+            return Ok(0);
+        }
+        let block_size = self.superblock.block_size as u64;
+        let bitmap_block = self.gdt[0].block_bitmap;
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        let mut buf = vec![0u8; block_size as usize];
+        self.reader.read_exact(&mut buf)?;
+
+        let max_bit = self.superblock.blocks_count as usize;
+        let start = bitmap::find_first_zero_run(&buf, count as usize, max_bit)
+            .ok_or(Ext4Error::NoSpace { what: "blocks" })?;
+        for i in 0..count as usize {
+            bitmap::set_bit(&mut buf, start + i);
+        }
+
+        self.reader
+            .seek(SeekFrom::Start(bitmap_block * block_size))?;
+        self.reader.write_all(&buf)?;
+
+        let new_free = (self.gdt[0].free_blocks_count as i64 - count as i64).max(0) as u32;
+        self.gdt[0].free_blocks_count = new_free;
+        self.superblock.free_blocks_count = self
+            .superblock
+            .free_blocks_count
+            .saturating_sub(count as u64);
+
+        Ok(start as u64)
+    }
+
+    /// Add a new entry to a single-block directory by carving
+    /// space out of the last entry's `rec_len` slack. v0 doesn't
+    /// allocate a new dir block when the existing one is full —
+    /// callers that hit that case get `UnsupportedV0`.
+    fn add_dir_entry(
+        &mut self,
+        parent_inode: &Inode,
+        name: &[u8],
+        child_inode: u32,
+        file_type: u8,
+    ) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let block_size = self.superblock.block_size as usize;
+
+        // Resolve parent's first data block.
+        let physical =
+            self.resolve_logical_block(parent_inode, 0)?
+                .ok_or(Ext4Error::InvalidLayout {
+                    reason: "directory has no first data block",
+                })?;
+
+        let block_byte_offset = physical * (block_size as u64);
+        self.reader.seek(SeekFrom::Start(block_byte_offset))?;
+        let mut block_buf = vec![0u8; block_size];
+        self.reader.read_exact(&mut block_buf)?;
+
+        // Walk to find the last entry in the block.
+        let mut cursor = 0usize;
+        let mut last_offset = 0usize;
+        let mut last_entry: Option<DirEntry> = None;
+        while cursor < block_size {
+            let entry = DirEntry::decode(&block_buf[cursor..])?;
+            last_offset = cursor;
+            cursor += entry.rec_len as usize;
+            last_entry = Some(entry);
+        }
+        let last = last_entry.ok_or(Ext4Error::InvalidLayout {
+            reason: "directory block has no entries",
+        })?;
+
+        // Compute the actual padded size of the last entry — its
+        // rec_len typically absorbs the rest of the block, so the
+        // slack is the full block minus the consumed prefix.
+        let last_actual = pad4(8 + last.name.len()) as u16;
+        let new_actual = pad4(8 + name.len()) as u16;
+        if new_actual as usize > last.rec_len as usize - last_actual as usize {
+            return Err(Ext4Error::UnsupportedV0 {
+                detail: "directory block full; v0 doesn't allocate a new dir block",
+            });
+        }
+
+        // Shrink last entry's rec_len down to its actual size.
+        let mut shrunk = last.clone();
+        shrunk.rec_len = last_actual;
+        shrunk.encode_into(&mut block_buf[last_offset..last_offset + last_actual as usize])?;
+
+        // New entry fills the rest of the block.
+        let new_offset = last_offset + last_actual as usize;
+        let new_rec_len = (block_size - new_offset) as u16;
+        let new_entry = DirEntry {
+            inode: child_inode,
+            rec_len: new_rec_len,
+            file_type_raw: file_type,
+            name: name.to_vec(),
+        };
+        new_entry.encode_into(&mut block_buf[new_offset..])?;
+
+        self.reader.seek(SeekFrom::Start(block_byte_offset))?;
+        self.reader.write_all(&block_buf)?;
+        Ok(())
+    }
+
+    /// Create a regular file at `path` with the given contents.
+    /// Returns the new file's inode number.
+    ///
+    /// v0 limits documented in the docstring of every called
+    /// helper: single block group; parent directory must have
+    /// slack in its single data block; contiguous block
+    /// allocation only (no fragmentation across the disk).
+    pub fn create_file(&mut self, path: &str, data: &[u8]) -> Result<u32, Ext4Error>
+    where
+        R: Write,
+    {
+        let (parent_path, filename) = Self::split_path(path)?;
+        let parent_inode_num = self.open_path(parent_path)?;
+        let parent_inode = self.read_inode(parent_inode_num)?;
+        if !parent_inode.is_directory() {
+            return Err(Ext4Error::NotADirectory {
+                inode: parent_inode_num,
+            });
+        }
+
+        // Reject collision so the caller can route on it. The
+        // typed AlreadyExists is more useful than a silent
+        // overwrite.
+        match self.lookup(&parent_inode, filename.as_bytes()) {
+            Ok(_) => {
+                return Err(Ext4Error::AlreadyExists {
+                    name: filename.as_bytes().to_vec(),
+                });
+            }
+            Err(Ext4Error::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Allocate inode + data blocks.
+        let block_size = self.superblock.block_size as u64;
+        let num_blocks = (data.len() as u64).div_ceil(block_size);
+        let new_inode_num = self.allocate_inode()?;
+        let physical_start = self.allocate_blocks_contiguous(num_blocks as u32)?;
+
+        // Build the new inode.
+        let mut block_bytes = [0u8; I_BLOCK_LEN];
+        let header = ExtentHeader {
+            entries: if num_blocks > 0 { 1 } else { 0 },
+            max: 4,
+            depth: 0,
+            generation: 0,
+        };
+        header.encode_into(&mut block_bytes[..12])?;
+        if num_blocks > 0 {
+            let extent = Extent {
+                logical_block: 0,
+                len: num_blocks as u16,
+                physical_block: physical_start,
+                uninit: false,
+            };
+            extent.encode_into(&mut block_bytes[12..24])?;
+        }
+
+        let new_inode = Inode {
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            size: data.len() as u64,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: 0,
+            links_count: 1,
+            blocks_lo: ((num_blocks * block_size) / 512) as u32,
+            blocks_hi: 0,
+            flags: INODE_FLAG_EXTENTS,
+            block: block_bytes,
+            generation: 0,
+            file_acl_lo: 0,
+            file_acl_hi: 0,
+        };
+        self.write_inode(new_inode_num, &new_inode)?;
+
+        // Write file contents into the allocated data blocks.
+        if num_blocks > 0 {
+            let total_alloc_bytes = (num_blocks * block_size) as usize;
+            let mut buf = vec![0u8; total_alloc_bytes];
+            buf[..data.len()].copy_from_slice(data);
+            self.reader
+                .seek(SeekFrom::Start(physical_start * block_size))?;
+            self.reader.write_all(&buf)?;
+        }
+
+        // Add the dir entry to the parent. We re-read the parent
+        // inode so any updates from add_dir_entry land on a fresh
+        // copy if it ever needs to mutate the inode itself.
+        self.add_dir_entry(
+            &parent_inode,
+            filename.as_bytes(),
+            new_inode_num,
+            1, // EXT4_FT_REG_FILE
+        )?;
+
+        // Persist superblock + GDT counter changes.
+        self.flush_metadata()?;
+
+        Ok(new_inode_num)
+    }
+}
+
+/// 4-byte alignment helper used by directory-entry placement.
+fn pad4(n: usize) -> usize {
+    n.div_ceil(4) * 4
 }
 
 #[cfg(test)]

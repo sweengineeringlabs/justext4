@@ -49,6 +49,26 @@ pub enum Ext4Error {
     #[error("not a directory: inode {inode}")]
     NotADirectory { inode: u32 },
 
+    /// A creation operation found an entry already at the target
+    /// name. Surfaces the colliding name so callers can prompt
+    /// the user or pick a different filename.
+    #[error("already exists: {name:?}")]
+    AlreadyExists { name: Vec<u8> },
+
+    /// Allocator exhausted — no free inode or no contiguous
+    /// block run of the requested length. The `what` field names
+    /// which resource ran out.
+    #[error("no space: {what}")]
+    NoSpace { what: &'static str },
+
+    /// A write operation can't proceed because the surrounding
+    /// state is one v0 doesn't yet handle (e.g. directory full
+    /// and would need a new data block, multi-group images for
+    /// allocation). Documents the gap in the error itself so
+    /// production code can route on it.
+    #[error("unsupported in v0: {detail}")]
+    UnsupportedV0 { detail: &'static str },
+
     /// Encode-side errors when writing structures back to bytes
     /// (used by `mkfs::format` and any future write paths).
     #[error("superblock encode: {0}")]
