@@ -589,3 +589,97 @@ fn test_format_then_symlink_passes_e2fsck_clean() {
         "e2fsck found a problem requiring fix after symlink"
     );
 }
+
+/// `format → create_file → truncate → e2fsck-clean`. Validates
+/// the truncate path against kernel-grade fsck.
+///
+/// The scenario covers the load-bearing shrink case: a 2-block
+/// file is truncated mid-first-block, freeing the second block
+/// and rewriting the leaf extent's `len` to 1. Bug it catches:
+/// a truncate that frees blocks but doesn't update the leaf
+/// extent's `len` leaves a phantom range in the extent tree
+/// pointing at now-free blocks; e2fsck flags it in pass 1
+/// ("Inode N, i_blocks is X, should be Y" or "Inode N has
+/// illegal block(s)"). A truncate that updates the extent but
+/// doesn't decrement the bitmap free count drifts pass 5
+/// ("Free blocks count wrong"). A truncate that forgets to
+/// update `inode.size` or `blocks_lo` lands as pass 1's
+/// "i_blocks is X, should be Y".
+#[test]
+fn test_format_then_create_file_then_truncate_passes_e2fsck_clean() {
+    let runner = detect_runner();
+    if matches!(runner, E2fsckRunner::Unavailable) {
+        eprintln!(
+            "SKIP: e2fsck not on PATH and JUSTEXT4_E2FSCK_VIA_WSL not set; \
+             cannot validate post-truncate image state"
+        );
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "justext4-e2fsck-truncate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("image.ext4");
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&img)
+        .unwrap();
+    format(&mut file, &Config::default()).unwrap();
+    drop(file);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img)
+        .unwrap();
+    let mut fs = Filesystem::open(file).unwrap();
+    let block_size = fs.superblock().block_size as usize;
+    // Two-block payload so the shrink frees a real block.
+    let payload = vec![0xAB; block_size + 1];
+    fs.create_file("/shrinkme.bin", &payload).unwrap();
+    // Cut to mid-first-block — exercises the partial-shrink path:
+    // last extent's len drops from 2 to 1, the second physical
+    // block is freed, inode.size + blocks_lo are rewritten.
+    fs.truncate("/shrinkme.bin", (block_size / 2) as u64)
+        .unwrap();
+    drop(fs);
+
+    let mut cmd = build_command(&runner, &img);
+    eprintln!("running: {cmd:?}");
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn e2fsck");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- e2fsck stdout ---\n{stdout}");
+    eprintln!("--- e2fsck stderr ---\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "e2fsck rejected post-truncate image (exit code: {:?})",
+        output.status.code()
+    );
+    assert!(
+        !stdout.contains("WARNING"),
+        "e2fsck flagged warnings after truncate; bitmap/extent/blocks_lo drift?"
+    );
+    assert!(
+        !stdout.contains("Fix?"),
+        "e2fsck found a problem requiring fix after truncate"
+    );
+}

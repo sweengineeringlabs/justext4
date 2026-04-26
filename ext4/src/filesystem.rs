@@ -1220,6 +1220,202 @@ impl<R: Read + Seek> Filesystem<R> {
 
         Ok(new_inode_num)
     }
+
+    /// Change a regular file's size to `new_size`.
+    ///
+    /// Three cases, mirroring POSIX `truncate(2)` semantics:
+    ///
+    /// 1. **No-op** — `new_size == inode.size`. Return Ok without
+    ///    touching disk.
+    ///
+    /// 2. **Shrink** — `new_size < inode.size`. Free any blocks
+    ///    past `ceil(new_size / block_size)`. Walks the (single,
+    ///    depth-0) extent in `i_block`: extents wholly past the
+    ///    cutoff are freed in full; the extent that straddles the
+    ///    cutoff is partial-shrunk (its `len` is reduced and the
+    ///    trailing physical blocks are freed). The inode's `size`
+    ///    and `blocks_lo` are updated to match. Bytes between the
+    ///    cutoff and the end of the last surviving block become
+    ///    "tail slack" the kernel ignores — `read_file` truncates
+    ///    output to `inode.size`.
+    ///
+    /// 3. **Grow** — `new_size > inode.size`. v0 supports this
+    ///    ONLY when the new size still fits within the byte-end of
+    ///    currently-allocated blocks (i.e. `new_size <=
+    ///    allocated_blocks * block_size`). In that case the size
+    ///    field is bumped and the bytes between the old and new
+    ///    size read as zeros (whatever was on disk in the tail
+    ///    slack — typically zeroed by `create_file`'s padding).
+    ///    A grow that would require allocating new blocks returns
+    ///    [`Ext4Error::UnsupportedV0`]; full sparse-grow + new-
+    ///    extent allocation lands when a real consumer needs it.
+    ///
+    /// Refuses non-regular inodes with [`Ext4Error::NotARegularFile`]
+    /// — directories have `rmdir` semantics, symlinks are inline,
+    /// device nodes have no data. Mirrors POSIX truncate's `EISDIR`
+    /// / `EINVAL`.
+    ///
+    /// `mtime` and `ctime` are stamped to the deterministic
+    /// timestamp `0x6500_0000` used elsewhere in the formatter,
+    /// so two runs against identical inputs produce byte-identical
+    /// images.
+    pub fn truncate(&mut self, path: &str, new_size: u64) -> Result<(), Ext4Error>
+    where
+        R: Write,
+    {
+        let inode_num = self.open_path(path)?;
+        let mut inode = self.read_inode(inode_num)?;
+
+        if !inode.is_regular() {
+            return Err(Ext4Error::NotARegularFile { inode: inode_num });
+        }
+
+        // No-op: size already matches.
+        if new_size == inode.size {
+            return Ok(());
+        }
+
+        let block_size = self.superblock.block_size as u64;
+
+        if new_size > inode.size {
+            // Grow path. v0 only handles the "still fits in the
+            // already-allocated tail" case. Anything else needs
+            // new block allocation, deferred.
+            //
+            // We compute capacity from the extent tree rather than
+            // from `blocks_lo` so an inode with stale metadata
+            // (e.g. produced by an external tool) doesn't fool us
+            // into believing we have more room than the extents
+            // actually map. blocks_lo is in 512-byte sectors; the
+            // extent total is the source of truth.
+            let allocated_blocks = if inode.uses_extents() && inode.size > 0 {
+                let node = decode_extent_node(&inode.block)?;
+                match node {
+                    ExtentNode::Leaf { extents, .. } => {
+                        extents.iter().map(|e| e.len as u64).sum::<u64>()
+                    }
+                    // Internal nodes mean depth>0 — out of v0 scope
+                    // for write paths just like elsewhere in this
+                    // module. Treat as "no capacity we can prove"
+                    // and reject the grow.
+                    ExtentNode::Internal { .. } => {
+                        return Err(Ext4Error::UnsupportedV0 {
+                            detail: "truncate-grow on depth>0 extent tree not yet supported",
+                        });
+                    }
+                }
+            } else {
+                0
+            };
+            let capacity_bytes = allocated_blocks * block_size;
+
+            if new_size > capacity_bytes {
+                return Err(Ext4Error::UnsupportedV0 {
+                    detail: "truncate-grow with new block allocation not yet supported",
+                });
+            }
+
+            // Pure size bump — no extent or bitmap changes needed.
+            inode.size = new_size;
+            inode.mtime = 0x6500_0000;
+            inode.ctime = 0x6500_0000;
+            self.write_inode(inode_num, &inode)?;
+            self.flush_metadata()?;
+            return Ok(());
+        }
+
+        // Shrink path. new_size < inode.size.
+        //
+        // Compute the cutoff in logical blocks: any logical block
+        // index >= cutoff is wholly past the new EOF and gets freed.
+        // The block at index (cutoff-1) may straddle the new EOF
+        // when new_size isn't a block multiple, but its data stays
+        // — read_file truncates the output to inode.size.
+        let cutoff_blocks = new_size.div_ceil(block_size);
+
+        if !inode.uses_extents() {
+            return Err(Ext4Error::NotExtentBased);
+        }
+
+        // We rebuild the leaf extent list in place. The shape
+        // create_file produces is a depth-0 tree with at most one
+        // extent, but the loop below handles the general single-
+        // leaf case (multiple extents) correctly without needing a
+        // separate branch.
+        let node = decode_extent_node(&inode.block)?;
+        let extents = match node {
+            ExtentNode::Leaf { extents, .. } => extents,
+            ExtentNode::Internal { .. } => {
+                return Err(Ext4Error::UnsupportedV0 {
+                    detail: "truncate-shrink on depth>0 extent tree not yet supported",
+                });
+            }
+        };
+
+        let mut surviving: Vec<Extent> = Vec::with_capacity(extents.len());
+        for ext in extents {
+            let ext_start = ext.logical_block as u64;
+            let ext_end = ext_start + ext.len as u64; // exclusive
+
+            if ext_end <= cutoff_blocks {
+                // Wholly before cutoff — keeps in full.
+                surviving.push(ext);
+            } else if ext_start >= cutoff_blocks {
+                // Wholly past cutoff — free all its blocks.
+                if !ext.uninit {
+                    self.free_blocks(ext.physical_block, ext.len as u32)?;
+                }
+                // (Don't push to surviving.)
+            } else {
+                // Straddles the cutoff. Keep the prefix
+                // [ext_start, cutoff_blocks); free the suffix
+                // [cutoff_blocks, ext_end).
+                let kept_len = (cutoff_blocks - ext_start) as u16;
+                let freed_len = (ext_end - cutoff_blocks) as u32;
+                let freed_start = ext.physical_block + kept_len as u64;
+                if !ext.uninit {
+                    self.free_blocks(freed_start, freed_len)?;
+                }
+                surviving.push(Extent {
+                    logical_block: ext.logical_block,
+                    len: kept_len,
+                    physical_block: ext.physical_block,
+                    uninit: ext.uninit,
+                });
+            }
+        }
+
+        // Re-encode the leaf header + surviving extents into i_block.
+        // Empty file → header with entries=0, no extent records.
+        let mut block_bytes = [0u8; I_BLOCK_LEN];
+        let header = ExtentHeader {
+            entries: surviving.len() as u16,
+            max: 4,
+            depth: 0,
+            generation: 0,
+        };
+        header.encode_into(&mut block_bytes[..12])?;
+        for (i, ext) in surviving.iter().enumerate() {
+            let off = 12 + i * 12;
+            ext.encode_into(&mut block_bytes[off..off + 12])?;
+        }
+
+        // Recompute blocks_lo from the surviving extents. Stored in
+        // 512-byte sectors per the OSD2 convention used elsewhere
+        // in this module (no INODE_FLAG_HUGE_FILE).
+        let surviving_blocks: u64 = surviving.iter().map(|e| e.len as u64).sum();
+        let surviving_sectors = (surviving_blocks * block_size) / 512;
+
+        inode.size = new_size;
+        inode.blocks_lo = surviving_sectors as u32;
+        inode.block = block_bytes;
+        inode.mtime = 0x6500_0000;
+        inode.ctime = 0x6500_0000;
+
+        self.write_inode(inode_num, &inode)?;
+        self.flush_metadata()?;
+        Ok(())
+    }
 }
 
 /// 4-byte alignment helper used by directory-entry placement.

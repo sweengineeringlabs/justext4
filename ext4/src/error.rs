@@ -55,6 +55,15 @@ pub enum Ext4Error {
     #[error("is a directory: inode {inode}")]
     IsADirectory { inode: u32 },
 
+    /// `truncate` was called on an inode that isn't a regular
+    /// file (a directory, symlink, device node, etc.). POSIX
+    /// `truncate(2)` returns `EISDIR` for directories and
+    /// `EINVAL` for other non-regular targets — we collapse
+    /// both into one variant since the only caller distinction
+    /// that matters is "regular vs not".
+    #[error("not a regular file: inode {inode}")]
+    NotARegularFile { inode: u32 },
+
     /// `rmdir` was called on a directory that still contains
     /// entries other than `.` and `..`. Mirrors POSIX
     /// `ENOTEMPTY` semantics. The caller should `unlink` /
