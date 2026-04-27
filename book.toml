@@ -1,0 +1,12 @@
+[book]
+title = "justext4"
+description = "Pure-Rust ext4 read-only filesystem and image builder"
+authors = ["SWE Engineering Labs"]
+language = "en"
+src = "docs"
+multilingual = false
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/sweengineeringlabs/justext4"
+edit-url-template = "https://github.com/sweengineeringlabs/justext4/edit/main/{path}"

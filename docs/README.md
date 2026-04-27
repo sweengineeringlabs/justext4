@@ -12,7 +12,7 @@ Organised by SDLC phase, mirroring the
 - [`6-deployment/deployment_guide.md`](6-deployment/deployment_guide.md)
   — two integration patterns (library API vs CLI binary), reference
   integration in vmisolate, downstream CI shape, image-size limits.
-- [`7-operations/operations_manual.md`](7-operations/operations_manual.md)
+- [`6-deployment/operations_manual.md`](6-deployment/operations_manual.md)
   — operator-facing CLI reference, common gestures, error map,
   v0 limits, troubleshooting.
 
