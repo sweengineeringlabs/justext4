@@ -1,5 +1,89 @@
 # Architecture
 
+## Diagrams
+
+Four diagrams covering inclusion (which crates depend on which), block (runtime layout of a typical write/read), data flow (file tree → image bytes), and sequence (the build then read calls). The ASCII pipeline below is the same picture in a different style.
+
+### Inclusion: workspace dep graph
+
+```mermaid
+flowchart TD
+  cli["cli<br/>(mkext4-rs binary)"]
+  ext4["ext4<br/>(Filesystem&lt;R&gt;: open / create_file / mkdir / ...)"]
+  spec["spec<br/>(byte layouts: Superblock, Inode, Extent, DirEntry)"]
+
+  cli --> ext4
+  ext4 --> spec
+
+  subgraph rust [pure-Rust stdlib only]
+    spec
+    ext4
+    cli
+  end
+```
+
+### Block: runtime layout
+
+```mermaid
+flowchart LR
+  Caller["caller (Read+Write+Seek byte stream)"]
+  FS["ext4::Filesystem&lt;R&gt;"]
+  Alloc["block + inode allocators"]
+  Writer["superblock + inode-table + bitmap writers"]
+  Reader["inode lookup + extent walker"]
+  Bytes["bytes on disk (e2fsck-clean ext4)"]
+
+  Caller --> FS
+  FS -->|create_file / mkdir / write| Alloc
+  FS -->|open / read| Reader
+  Alloc --> Writer
+  Writer --> Bytes
+  Reader --> Bytes
+```
+
+### Data flow: file tree → image bytes
+
+```mermaid
+flowchart TD
+  Tree[caller's file tree] --> DirEnts[directory entries]
+  DirEnts --> InodeAlloc[inode allocation]
+  InodeAlloc --> ExtentMap[extent placement]
+  ExtentMap --> BlockBitmap[block bitmap update]
+  BlockBitmap --> SBWrite[superblock + GD writes]
+  SBWrite --> Bytes[final image bytes]
+  Bytes --> Mountable[Linux kernel mount-able ext4]
+  Bytes --> E2fsck[e2fsck-clean]
+```
+
+### Sequence: build then read
+
+```mermaid
+sequenceDiagram
+  participant App as caller
+  participant FS as ext4::Filesystem
+  participant Alloc as allocator
+  participant W as writer
+  participant Img as image bytes
+
+  App->>FS: format(R, layout)
+  FS->>W: superblock + group descriptors
+  W->>Img: bytes
+  App->>FS: create_file("/etc/passwd", mode, uid)
+  FS->>Alloc: claim inode + blocks
+  Alloc-->>FS: ino, extents
+  FS->>W: inode + dir entry + data blocks
+  W->>Img: bytes
+
+  Note over App,Img: image now mountable / readable
+
+  App->>FS: open("/etc/passwd")
+  FS->>FS: walk dir entries to inode
+  FS->>FS: walk extents
+  FS-->>App: bytes
+```
+
+## Pipeline (ASCII)
+
 ```
                        ┌──────────────────┐
                        │  Read+Write+Seek │
