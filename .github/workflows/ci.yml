@@ -57,6 +57,23 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Windows job proves "no WSL2, no e2fsprogs" — just cargo.
+  # The e2fsck-acceptance tests guard-pass on Windows (no e2fsck on
+  # the runner); that is the intended behaviour, not a gap.
+  windows:
+    name: cargo test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace
+
   fmt:
     name: cargo fmt --check
     runs-on: ubuntu-latest

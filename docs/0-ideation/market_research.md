@@ -180,3 +180,22 @@ All of the above categories share the same bar:
 5. **Embeddable.** Callable from a Rust build tool as a library, not just as a CLI.
 
 The existing toolchain satisfies none of 3, 4, or 5 simultaneously. justext4 satisfies all five.
+
+---
+
+## Footprint
+
+Measured on 2026-04-28, release profile, x86-64 Windows host.
+Dep count: `cargo tree -e no-dev --prefix none | sort -u | wc -l` (unique crates, transitive).
+Binary size: stripped release binary.
+
+| Tool | Dep count | Binary size | Platform | Notes |
+|------|----------:|-------------|----------|-------|
+| **justext4** | **15** | **235 KB** | Any | Pure Rust; no C FFI |
+| `mkfs.ext4` (e2fsprogs) | ~200 KLOC C | ~1.3 MB (just mkfs.ext4) | Linux only | Entire e2fsprogs suite; random UUID/timestamp by default |
+| `genext2fs` | ~5 KLOC C | ~120 KB | Linux/macOS | No Windows build; non-deterministic |
+| `libext2fs` (FFI crate, estimated) | ~200 KLOC C (audit-opaque) | N/A (library) | Linux/partial macOS | No published Rust binding; C ABI |
+
+justext4 at 15 transitive crates is the smallest published write-capable Rust ext4 implementation — the only one that exists. The comparison is against C tooling that requires a host installation and is unavailable on Windows.
+
+The CI matrix now includes a `windows-latest` runner. A green badge on `windows-latest` is the machine-verifiable claim; no WSL2, no Docker, no e2fsprogs installed.

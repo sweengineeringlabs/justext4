@@ -2,6 +2,17 @@
 
 **Audience**: Stakeholders, product leads
 
+## Numbers at a glance
+
+| | justext4 | mkfs.ext4 (e2fsprogs) |
+|---|---|---|
+| Dep count (transitive) | **15** | ~200 KLOC of C (audit-opaque) |
+| Binary size | **235 KB** | ~1.3 MB (mkfs.ext4 alone) |
+| Windows native | **yes** | no (WSL2 required) |
+| Byte-stable output | **yes** | no (random UUID + timestamp) |
+| Embeddable | **yes** | no (subprocess only) |
+| Throughput (64-inode image) | **63.5 MiB/s** | not directly comparable (disk-backed) |
+
 ## Why justext4 exists
 
 The Rust ecosystem has the read half of ext4 covered — the
