@@ -88,6 +88,12 @@ mkext4-rs touch <image> <vfs-path> <content>
 mkext4-rs cat <image> <vfs-path>
 ```
 
+## Documentation
+
+See [`docs/README.md`](docs/README.md) for the full documentation hub (SDLC-phase index covering architecture, developer guide, testing strategy, deployment, and operations).
+
+See [`docs/SUMMARY.md`](docs/SUMMARY.md) for the mdbook-style reading order.
+
 ## Sibling repos
 
 - [`vmisolate`](../vmisolate) — first consumer (rootfs build path).

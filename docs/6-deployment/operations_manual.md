@@ -1,5 +1,7 @@
 # Operations manual
 
+**Audience**: Operators, platform engineers
+
 Operator-facing reference for `mkext4-rs`. Library API users see the
 [developer guide](../4-development/developer_guide.md) instead.
 

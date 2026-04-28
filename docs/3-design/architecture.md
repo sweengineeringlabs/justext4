@@ -1,5 +1,9 @@
 # Architecture
 
+**Audience**: Architects, contributors
+
+> **TLDR**: Three-crate pipeline — spec (byte layouts, no IO) → ext4 (`Filesystem<R>`, format/read/write API) → cli (`mkext4-rs` binary) — with a contiguous-block allocator and symmetric encode/decode for byte-stable, reproducible output.
+
 ## Diagrams
 
 Four diagrams covering inclusion (which crates depend on which), block (runtime layout of a typical write/read), data flow (file tree → image bytes), and sequence (the build then read calls). The ASCII pipeline below is the same picture in a different style.
@@ -251,10 +255,8 @@ across runs — pinned by an always-on test in
 `ext4/tests/reproducibility.rs`.
 
 This matters for any consumer that wants to verify "did anything in
-the input change?" by comparing image digests across builds. The
-SLSA-style story is the same as
-[`justoci`](https://github.com/sweengineeringlabs/justoci)'s reproducibility
-guarantee; we mirror it.
+the input change?" by comparing image digests across builds — the
+same guarantee any SLSA-attested artifact pipeline requires.
 
 ### Single-group v0
 
@@ -278,8 +280,7 @@ fragment and large allocations will fail. Tracked as
 
 ### Why not depend on `bytemuck` / `zerocopy`
 
-Tempting for any byte-layout crate. We don't, for the same reason
-`justcas` and `justoci` don't:
+Tempting for any byte-layout crate. We don't:
 
 - Defends the "pure Rust, no proc-macros, MSRV stable for years" promise
 - The on-disk format is small and stable; hand-rolled encode/decode is
@@ -295,16 +296,10 @@ This lets a consumer hold a `Filesystem<File>` and call any method;
 a consumer holding `Filesystem<&[u8]>` (read-only mmap) only sees the
 read methods.
 
-## Cross-repo siblings
+## Known consumers
 
 - [`vmisolate`](https://github.com/sweengineeringlabs/vmisolate) —
   first consumer. `scripts/build-rootfs-justext4.sh` wraps `mkext4-rs
   build-from-tree` to produce kernel-mountable rootfs images without
   WSL, replacing the `mkfs.ext4 + mount + cp -a + umount` shell-out
   on the scratch-base path.
-- [`justoci`](https://github.com/sweengineeringlabs/justoci) — produces
-  attested OCI artifacts whose payload can be ext4 images built by
-  this crate.
-- [`justcas`](https://github.com/sweengineeringlabs/justcas) — content-
-  addressed-storage primitive; not used by justext4 directly but is a
-  pattern sibling for "primitive, no deps, reusable."

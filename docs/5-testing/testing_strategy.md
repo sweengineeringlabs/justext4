@@ -1,5 +1,7 @@
 # Testing strategy
 
+**Audience**: Contributors, QA
+
 justext4 is a filesystem builder — its output gets consumed by Linux kernels and `e2fsck`. Tests fall into four layers, each catching a different bug class.
 
 ## Layer 1 — Unit tests (`#[cfg(test)]` per module)

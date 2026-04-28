@@ -1,5 +1,7 @@
 # Value proposition
 
+**Audience**: Stakeholders, product leads
+
 ## Why justext4 exists
 
 The Rust ecosystem has the read half of ext4 covered — the
@@ -66,9 +68,9 @@ review.
   shell-out chain (`mkfs.ext4 + mount + cp -a + umount`) with a
   single subprocess invocation of `mkext4-rs build-from-tree`.
 - **Reproducible-image pipelines** — anything wiring ext4 images
-  into SLSA-attested or content-addressed artifact systems
-  (justoci-style flows). The byte-stability contract means an image
-  digest is a fingerprint of the input, full stop.
+  into SLSA-attested or content-addressed artifact systems.
+  The byte-stability contract means an image digest is a
+  fingerprint of the input, full stop.
 - **Embedded firmware tooling** — products that ship ext4 images as
   flashable artifacts and want a tiny, auditable build path that
   runs on the developer's laptop without root and without a Linux
@@ -103,10 +105,6 @@ These are not what justext4 is and never will be:
   The output is verified by `e2fsck -nf` (independent
   implementation) and by the Linux kernel's `mount -o loop` path.
 
-## Positioning relative to siblings
+## Licence
 
-justext4 sits in the same "primitive, no deps, reusable" family as
-[`justcas`](https://github.com/sweengineeringlabs/justcas) and
-[`justoci`](https://github.com/sweengineeringlabs/justoci).
-Apache-2.0 licence, mirroring both — see
-[`README.md:114-118`](../../README.md).
+Apache-2.0. See [`README.md`](../../README.md).

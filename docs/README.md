@@ -1,8 +1,11 @@
 # justext4 docs
 
-Organised by SDLC phase, mirroring the
-[`justoci`](https://github.com/sweengineeringlabs/justoci) sibling.
+**Audience**: All
 
+Organised by SDLC phase.
+
+- [`0-ideation/value_proposition.md`](0-ideation/value_proposition.md) — what problem justext4 solves, who it's for, and the alternatives.
+- [`0-ideation/market_research.md`](0-ideation/market_research.md) — Rust ext4 ecosystem survey (existing crates, C tooling, gap matrix) and producer niche analysis (who needs a pure-Rust ext4 writer and why).
 - [`3-design/architecture.md`](3-design/architecture.md) — the three-
   crate layout, read + write data flow, key design decisions
   (pure-Rust, byte-stable output, single-group v0 cap).

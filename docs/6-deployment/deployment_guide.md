@@ -1,5 +1,7 @@
 # Deployment guide
 
+**Audience**: DevOps, integrators
+
 How to consume justext4 from another project. Two integration
 patterns exist; pick based on your build pipeline.
 
@@ -131,8 +133,8 @@ defensive but not strictly required.
 identical input. Pinned constants (timestamp, UUID, hash seed) make
 this hold; an always-on test in `ext4/tests/reproducibility.rs`
 asserts the contract. Consumers can compare image digests across
-rebuilds to detect input drift — same use case as the SLSA-attested
-build pattern in [`justoci`](https://github.com/sweengineeringlabs/justoci).
+rebuilds to detect input drift — the same guarantee required by any
+SLSA-attested or content-addressed artifact pipeline.
 
 If the consumer needs a non-pinned timestamp / UUID (e.g., when the
 image is meant to be unique-per-build for inventory tracking), the

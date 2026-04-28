@@ -1,10 +1,13 @@
 # Summary
 
+**Audience**: All
+
 [Introduction](README.md)
 
 # Ideation
 
 - [Value proposition](0-ideation/value_proposition.md)
+- [Market research](0-ideation/market_research.md)
 
 # Design
 

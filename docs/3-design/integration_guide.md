@@ -1,5 +1,7 @@
 # Integration guide
 
+**Audience**: Integrators, platform engineers
+
 How to integrate justext4 into other systems. Two integration shapes are supported: as a Rust library (the `ext4` crate), and as a CLI binary (`mkext4-rs`).
 
 ## As a library
