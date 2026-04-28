@@ -5,6 +5,7 @@
 Organised by SDLC phase.
 
 - [`0-ideation/value_proposition.md`](0-ideation/value_proposition.md) — what problem justext4 solves, who it's for, and the alternatives.
+- [`0-ideation/use_case.md`](0-ideation/use_case.md) — concrete actor + action + outcome descriptions: Windows CI rootfs builds, reproducible pipelines, embedded firmware, hermetic build systems.
 - [`0-ideation/market_research.md`](0-ideation/market_research.md) — Rust ext4 ecosystem survey (existing crates, C tooling, gap matrix) and producer niche analysis (who needs a pure-Rust ext4 writer and why).
 - [`3-design/architecture.md`](3-design/architecture.md) — the three-
   crate layout, read + write data flow, key design decisions
