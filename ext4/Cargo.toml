@@ -20,5 +20,12 @@ path = "src/lib.rs"
 spec      = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "write_image"
+harness = false
+
 [lints]
 workspace = true
