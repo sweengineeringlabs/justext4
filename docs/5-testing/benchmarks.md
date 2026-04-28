@@ -84,4 +84,4 @@ cargo bench -p swe_justext4_ext4 --bench write_image
 bash scripts/bench/compare_mkfs.sh
 ```
 
-HTML report: `target/criterion/format_image/report/index.html`
+The bench generates an HTML report at `target/criterion/format_image/report/index.html` (ephemeral — deleted by `cargo clean`; re-run the bench to regenerate).
